@@ -1,0 +1,17 @@
+/target/
+*.pdb
+
+# Local application and developer state
+/data/
+/state.json
+/tw.layton.rust-vpn-splitter/
+.env
+.env.*
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Local design QA captures may contain entered routes and machine paths
+/design-qa.md
+/design-qa-*.png
