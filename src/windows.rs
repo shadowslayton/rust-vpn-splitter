@@ -4,6 +4,9 @@ use std::{
     os::windows::process::CommandExt,
     process::{Command, Stdio},
     ptr,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -310,15 +313,6 @@ if ($null -eq $selectedRoute) {
 }
 "#;
 
-const IS_ELEVATED_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = [Security.Principal.WindowsPrincipal]::new($identity)
-$elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-[pscustomobject]@{ elevated = [bool]$elevated } | ConvertTo-Json -Compress
-"#;
-
 const APPLY_ROUTES_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
@@ -469,15 +463,6 @@ try {
 }
 "#;
 
-const RELAUNCH_ELEVATED_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$request = [Console]::In.ReadToEnd() | ConvertFrom-Json
-Start-Process -FilePath ([string]$request.executable) -Verb RunAs | Out-Null
-[pscustomobject]@{ ok = $true } | ConvertTo-Json -Compress
-"#;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkAdapter {
     pub index: u32,
@@ -543,11 +528,6 @@ pub struct ManagedRoute {
 }
 
 #[derive(Deserialize)]
-struct ElevationResponse {
-    elevated: bool,
-}
-
-#[derive(Deserialize)]
 struct ApplyResponse {
     ok: bool,
     message: String,
@@ -559,19 +539,17 @@ struct RouteRequest<'a> {
     desired: &'a [ManagedRoute],
 }
 
-#[derive(Serialize)]
-struct RelaunchRequest {
-    executable: String,
-}
-
 struct PowerShellOutput {
     success: bool,
     stdout: String,
     stderr: String,
 }
 
-pub fn discover_vpn_adapters() -> Result<Vec<NetworkAdapter>, String> {
-    let output = run_powershell(DISCOVER_ADAPTERS_SCRIPT, "")?;
+pub(crate) fn discover_vpn_adapters(
+    cancellation: &AtomicBool,
+) -> Result<Vec<NetworkAdapter>, String> {
+    let output =
+        run_powershell_with_cancellation(DISCOVER_ADAPTERS_SCRIPT, "", Some(cancellation))?;
     if !output.success {
         return Err(powershell_failure(&output));
     }
@@ -582,25 +560,17 @@ pub fn discover_vpn_adapters() -> Result<Vec<NetworkAdapter>, String> {
     Ok(adapters)
 }
 
-pub fn discover_internet_gateway() -> Result<Option<InternetGateway>, String> {
-    let output = run_powershell(DISCOVER_INTERNET_GATEWAY_SCRIPT, "")?;
+pub(crate) fn discover_internet_gateway(
+    cancellation: &AtomicBool,
+) -> Result<Option<InternetGateway>, String> {
+    let output =
+        run_powershell_with_cancellation(DISCOVER_INTERNET_GATEWAY_SCRIPT, "", Some(cancellation))?;
     if !output.success {
         return Err(powershell_failure(&output));
     }
 
     serde_json::from_str(output.stdout.trim())
         .map_err(|error| format!("無法解析一般網路閘道資料：{error}"))
-}
-
-pub fn is_elevated() -> Result<bool, String> {
-    let output = run_powershell(IS_ELEVATED_SCRIPT, "")?;
-    if !output.success {
-        return Err(powershell_failure(&output));
-    }
-
-    let response: ElevationResponse = serde_json::from_str(output.stdout.trim())
-        .map_err(|error| format!("無法解析管理員權限狀態：{error}"))?;
-    Ok(response.elevated)
 }
 
 pub fn existing_managed_routes(routes: &[ManagedRoute]) -> Result<Vec<ManagedRoute>, String> {
@@ -691,23 +661,19 @@ pub fn apply_routes(previous: &[ManagedRoute], desired: &[ManagedRoute]) -> Resu
     }
 }
 
-pub fn relaunch_elevated() -> Result<(), String> {
-    let executable =
-        std::env::current_exe().map_err(|error| format!("無法取得目前程式路徑：{error}"))?;
-    let request = serde_json::to_string(&RelaunchRequest {
-        executable: executable.to_string_lossy().into_owned(),
-    })
-    .map_err(|error| format!("無法建立重新啟動要求：{error}"))?;
-
-    let output = run_powershell(RELAUNCH_ELEVATED_SCRIPT, &request)?;
-    if output.success {
-        Ok(())
-    } else {
-        Err(powershell_failure(&output))
-    }
+fn run_powershell(script: &str, stdin_text: &str) -> Result<PowerShellOutput, String> {
+    run_powershell_with_cancellation(script, stdin_text, None)
 }
 
-fn run_powershell(script: &str, stdin_text: &str) -> Result<PowerShellOutput, String> {
+fn run_powershell_with_cancellation(
+    script: &str,
+    stdin_text: &str,
+    cancellation: Option<&AtomicBool>,
+) -> Result<PowerShellOutput, String> {
+    if cancellation.is_some_and(|token| token.load(Ordering::Acquire)) {
+        return Err("PowerShell 工作已取消。".to_owned());
+    }
+
     let mut child = Command::new("powershell.exe")
         .args([
             "-NoLogo",
@@ -727,6 +693,23 @@ fn run_powershell(script: &str, stdin_text: &str) -> Result<PowerShellOutput, St
         stdin
             .write_all(stdin_text.as_bytes())
             .map_err(|error| format!("無法傳送資料給 Windows PowerShell：{error}"))?;
+    }
+
+    if let Some(cancellation) = cancellation {
+        loop {
+            if cancellation.load(Ordering::Acquire) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("PowerShell 工作已取消。".to_owned());
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    return Err(format!("檢查 Windows PowerShell 狀態時發生錯誤：{error}"));
+                }
+            }
+        }
     }
 
     let output = child
@@ -1060,6 +1043,50 @@ function Remove-NetRoute {
         assert!(connected_f5.matches(VpnKind::F5));
         assert!(connected_f5.is_up());
         assert!(connected_f5.has_default_route);
+    }
+
+    #[test]
+    fn uncancelled_powershell_still_collects_its_output() {
+        let cancellation = AtomicBool::new(false);
+
+        let output = run_powershell_with_cancellation(
+            "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); Write-Output 'ready'",
+            "",
+            Some(&cancellation),
+        )
+        .expect("uncancelled PowerShell must complete");
+
+        assert!(output.success);
+        assert_eq!(output.stdout.trim(), "ready");
+        assert!(output.stderr.trim().is_empty());
+    }
+
+    #[test]
+    fn cancellation_stops_powershell_without_waiting_for_the_script() {
+        let cancellation = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_cancellation = std::sync::Arc::clone(&cancellation);
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            worker_cancellation.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+
+        let error = match run_powershell_with_cancellation(
+            "Start-Sleep -Seconds 10",
+            "",
+            Some(&cancellation),
+        ) {
+            Ok(_) => panic!("cancelled PowerShell must not complete normally"),
+            Err(error) => error,
+        };
+        canceller.join().expect("cancellation helper must finish");
+
+        assert!(error.contains("已取消"), "unexpected error: {error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancellation must stop PowerShell promptly; elapsed={:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

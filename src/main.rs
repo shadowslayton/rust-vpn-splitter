@@ -5,24 +5,6 @@ fn main() -> eframe::Result {
     const INITIAL_WINDOW_SIZE: [f32; 2] = [1280.0, 720.0];
     const MINIMUM_WINDOW_SIZE: [f32; 2] = [480.0, 420.0];
 
-    let preview_mode = cfg!(debug_assertions);
-
-    if !preview_mode {
-        match rust_vpn_splitter::windows::is_elevated() {
-            Ok(true) => {}
-            Ok(false) => {
-                if let Err(error) = rust_vpn_splitter::windows::relaunch_elevated() {
-                    eprintln!("{error}");
-                }
-                return Ok(());
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                return Ok(());
-            }
-        }
-    }
-
     let _single_instance = match rust_vpn_splitter::windows::acquire_single_instance() {
         Ok(Some(guard)) => guard,
         Ok(None) => return Ok(()),

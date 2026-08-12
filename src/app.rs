@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
     thread::{self, JoinHandle},
@@ -90,6 +91,10 @@ impl OperationKind {
             Self::RouteHealth => "正在背景核對分流路由…".to_owned(),
         }
     }
+
+    fn cancel_during_shutdown(self) -> bool {
+        matches!(self, Self::RefreshAdapters | Self::RouteHealth)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,17 +168,20 @@ struct PendingOperation {
     kind: OperationKind,
     receiver: Receiver<OperationResult>,
     handle: Option<JoinHandle<OperationResult>>,
+    cancellation: Arc<AtomicBool>,
 }
 
 impl PendingOperation {
     fn spawn(
         kind: OperationKind,
         repaint_context: egui::Context,
-        work: impl FnOnce() -> OperationResult + Send + 'static,
+        work: impl FnOnce(Arc<AtomicBool>) -> OperationResult + Send + 'static,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
         let handle = thread::spawn(move || {
-            let result = work();
+            let result = work(worker_cancellation);
             let _ = sender.send(result.clone());
             repaint_context.request_repaint();
             result
@@ -182,7 +190,12 @@ impl PendingOperation {
             kind,
             receiver,
             handle: Some(handle),
+            cancellation,
         }
+    }
+
+    fn cancel(&self) {
+        self.cancellation.store(true, Ordering::Release);
     }
 
     fn join(mut self) -> Result<OperationResult, String> {
@@ -273,11 +286,17 @@ fn reconcile_routes(
     })
 }
 
-fn run_refresh(previous: Vec<ManagedRoute>, config: SplitterConfig) -> OperationResult {
+fn run_refresh(
+    previous: Vec<ManagedRoute>,
+    config: SplitterConfig,
+    cancellation: Arc<AtomicBool>,
+) -> OperationResult {
     let (route_notice, gateway_notice, adapter_notice) = thread::scope(|scope| {
         let route_task = scope.spawn(move || reconcile_routes(previous, config));
-        let gateway_task = scope.spawn(discover_internet_gateway);
-        let adapter_task = scope.spawn(discover_vpn_adapters);
+        let gateway_cancellation = Arc::clone(&cancellation);
+        let gateway_task = scope.spawn(move || discover_internet_gateway(&gateway_cancellation));
+        let adapter_cancellation = Arc::clone(&cancellation);
+        let adapter_task = scope.spawn(move || discover_vpn_adapters(&adapter_cancellation));
 
         let route_notice = route_task
             .join()
@@ -689,6 +708,7 @@ fn run_route_health(
     current_routes: Vec<ManagedRoute>,
     config: SplitterConfig,
     refresh_endpoints: bool,
+    cancellation: Arc<AtomicBool>,
 ) -> OperationResult {
     let existing_routes = match existing_managed_routes(&current_routes) {
         Ok(routes) => routes,
@@ -704,8 +724,10 @@ fn run_route_health(
     }
 
     let (adapters, internet_gateway) = thread::scope(|scope| {
-        let adapter_task = scope.spawn(discover_vpn_adapters);
-        let gateway_task = scope.spawn(discover_internet_gateway);
+        let adapter_cancellation = Arc::clone(&cancellation);
+        let adapter_task = scope.spawn(move || discover_vpn_adapters(&adapter_cancellation));
+        let gateway_cancellation = Arc::clone(&cancellation);
+        let gateway_task = scope.spawn(move || discover_internet_gateway(&gateway_cancellation));
         let adapters = adapter_task
             .join()
             .unwrap_or_else(|_| Err("背景偵測 VPN 介面時異常終止。".to_owned()));
@@ -837,15 +859,15 @@ impl SplitterApp {
         self.next_endpoint_refresh_at = Instant::now();
         let previous = self.state.managed_routes.clone();
         let config = self.state.config.clone();
-        self.start_operation(OperationKind::RefreshAdapters, move || {
-            run_refresh(previous, config)
+        self.start_operation(OperationKind::RefreshAdapters, move |cancellation| {
+            run_refresh(previous, config, cancellation)
         });
     }
 
     fn start_operation(
         &mut self,
         kind: OperationKind,
-        work: impl FnOnce() -> OperationResult + Send + 'static,
+        work: impl FnOnce(Arc<AtomicBool>) -> OperationResult + Send + 'static,
     ) {
         if self.pending_operation.is_some() {
             return;
@@ -1494,8 +1516,8 @@ impl SplitterApp {
         }
         let current_routes = self.state.managed_routes.clone();
         let config = self.state.config.clone();
-        self.start_operation(OperationKind::RouteHealth, move || {
-            run_route_health(current_routes, config, refresh_endpoints)
+        self.start_operation(OperationKind::RouteHealth, move |cancellation| {
+            run_route_health(current_routes, config, refresh_endpoints, cancellation)
         });
     }
 
@@ -1512,7 +1534,7 @@ impl SplitterApp {
         let config = self.state.config.clone();
         let adapters = self.adapters.clone();
         let internet_gateway = self.internet_gateway.clone();
-        self.start_operation(OperationKind::RefreshDns, move || {
+        self.start_operation(OperationKind::RefreshDns, move |_cancellation| {
             run_dns_refresh(current_routes, config, adapters, internet_gateway)
         });
     }
@@ -1539,16 +1561,19 @@ impl SplitterApp {
         let config = self.state.config.clone();
         let adapters = self.adapters.clone();
         let internet_gateway = self.internet_gateway.clone();
-        self.start_operation(OperationKind::ToggleProfile { vpn, enabled }, move || {
-            run_toggle(
-                current_routes,
-                config,
-                adapters,
-                internet_gateway,
-                vpn,
-                enabled,
-            )
-        });
+        self.start_operation(
+            OperationKind::ToggleProfile { vpn, enabled },
+            move |_cancellation| {
+                run_toggle(
+                    current_routes,
+                    config,
+                    adapters,
+                    internet_gateway,
+                    vpn,
+                    enabled,
+                )
+            },
+        );
     }
 
     fn save_to_disk(&self) {
@@ -1558,10 +1583,13 @@ impl SplitterApp {
 
 impl Drop for SplitterApp {
     fn drop(&mut self) {
-        if let Some(pending) = self.pending_operation.take()
-            && let Ok(result) = pending.join()
-        {
-            self.apply_operation_result(result);
+        if let Some(pending) = self.pending_operation.take() {
+            if pending.kind.cancel_during_shutdown() {
+                pending.cancel();
+            }
+            if let Ok(result) = pending.join() {
+                self.apply_operation_result(result);
+            }
         }
         let _ = cleanup_managed_routes(&mut self.state);
         self.save_to_disk();
@@ -2510,7 +2538,7 @@ mod tests {
         let mut app = full_tunnel_app(VpnKind::F5);
         app.banner = Banner::Success("keep this result visible".to_owned());
 
-        app.start_operation(OperationKind::RefreshDns, || {
+        app.start_operation(OperationKind::RefreshDns, |_| {
             OperationResult::RefreshDns(DnsRefreshOutcome::Unchanged)
         });
 
@@ -2544,7 +2572,7 @@ mod tests {
         app.pending_operation = Some(PendingOperation::spawn(
             OperationKind::RouteHealth,
             app.repaint_context.clone(),
-            || OperationResult::RouteHealth(RouteHealthOutcome::Healthy),
+            |_| OperationResult::RouteHealth(RouteHealthOutcome::Healthy),
         ));
         assert!(
             !app.user_interface_busy(),
@@ -2793,7 +2821,7 @@ mod tests {
                 vpn: VpnKind::F5,
                 enabled: true,
             },
-            || panic!("simulated enable worker crash"),
+            |_| panic!("simulated enable worker crash"),
         );
 
         for _ in 0..100 {
@@ -2841,6 +2869,79 @@ mod tests {
                 .iter()
                 .any(|text| text.contains("背景網路工作異常終止")),
             "the modal must preserve the unexpected worker failure reason; rendered text: {rendered_text:?}"
+        );
+    }
+
+    #[test]
+    fn closing_during_pending_adapter_refresh_cancels_detection_before_joining() {
+        let mut app = full_tunnel_app(VpnKind::F5);
+        let (worker_ready_sender, worker_ready_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (cancellation_sender, cancellation_receiver) = mpsc::channel();
+        app.pending_operation = Some(PendingOperation::spawn(
+            OperationKind::RefreshAdapters,
+            app.repaint_context.clone(),
+            move |cancellation| {
+                worker_ready_sender
+                    .send(())
+                    .expect("test worker announces that detection has started");
+                let cancelled = loop {
+                    if cancellation.load(Ordering::Acquire) {
+                        break true;
+                    }
+                    match release_receiver.recv_timeout(Duration::from_millis(1)) {
+                        Ok(()) => break false,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break false,
+                    }
+                };
+                cancellation_sender
+                    .send(cancelled)
+                    .expect("test records whether shutdown cancelled detection");
+                OperationResult::Refresh(RefreshOutcome {
+                    route_notice: Ok(ReconciledRoutes {
+                        routes: Vec::new(),
+                        removed: 0,
+                    }),
+                    gateway_notice: Ok(None),
+                    adapter_notice: Ok(Vec::new()),
+                })
+            },
+        ));
+        worker_ready_receiver
+            .recv()
+            .expect("pending adapter detection must start");
+
+        let (drop_finished_sender, drop_finished_receiver) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(app);
+            drop_finished_sender
+                .send(())
+                .expect("test observes app shutdown completion");
+        });
+        let closed_without_waiting = drop_finished_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+        if !closed_without_waiting {
+            release_sender
+                .send(())
+                .expect("test releases uncancelled detection after proving it blocked shutdown");
+            drop_finished_receiver
+                .recv()
+                .expect("released shutdown must finish");
+        }
+        let detection_was_cancelled = cancellation_receiver
+            .recv()
+            .expect("detection worker must report its shutdown state");
+        dropper.join().expect("shutdown thread must finish");
+
+        assert!(
+            closed_without_waiting,
+            "shutdown must not wait for read-only adapter detection"
+        );
+        assert!(
+            detection_was_cancelled,
+            "shutdown must cancel adapter detection before joining its worker"
         );
     }
 
@@ -2925,7 +3026,7 @@ mod tests {
                 enabled: true,
             },
             app.repaint_context.clone(),
-            move || {
+            move |_cancellation| {
                 worker_ready_sender
                     .send(())
                     .expect("test worker announces that it is blocked");
