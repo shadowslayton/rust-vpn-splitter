@@ -1,0 +1,4 @@
+interface:
+  display_name: "Install Release App"
+  short_description: "Build, install, verify, and clean the release app"
+  default_prompt: "Use $install-release-app to install the current Rust VPN Splitter release and clean its build artifacts."

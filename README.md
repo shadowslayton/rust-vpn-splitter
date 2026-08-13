@@ -30,3 +30,26 @@ http://gitlab.example.test:1500/
 ```
 
 網址會依主機名稱解析成 IP；通訊協定、路徑與連接埠不影響 Windows 路由結果。
+
+## 安裝
+
+完成開發與測試後，以固定位置安裝 release 版本：
+
+```powershell
+& .\scripts\install.ps1
+```
+
+腳本會執行 locked release build、要求系統管理員權限、將程式安裝到
+`C:\Program Files\Rust VPN Splitter`，並建立開始功能表捷徑。工作列應釘選這個
+已安裝版本，不要釘選 `target` 內的建置產物。
+
+再次執行同一腳本即可更新已安裝版本。安裝完成後執行 `cargo clean` 不會移除
+已安裝的程式。
+
+## 解除安裝
+
+```powershell
+& "C:\Program Files\Rust VPN Splitter\uninstall.ps1"
+```
+
+解除安裝會移除程式與開始功能表捷徑，但保留 `%APPDATA%` 中的使用者設定。
