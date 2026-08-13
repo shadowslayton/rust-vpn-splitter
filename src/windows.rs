@@ -203,6 +203,22 @@ $adapters = @(
             } else {
                 [string]$gatewayRoute.NextHop
             }
+            $dnsServers = @(
+                Get-DnsClientServerAddress `
+                    -InterfaceIndex ([uint32]$candidate.index) `
+                    -AddressFamily IPv4 `
+                    -ErrorAction SilentlyContinue |
+                    ForEach-Object { @($_.ServerAddresses) } |
+                    Where-Object {
+                        try {
+                            ([ipaddress]([string]$_)).AddressFamily -eq
+                                [Net.Sockets.AddressFamily]::InterNetwork
+                        } catch {
+                            $false
+                        }
+                    } |
+                    Select-Object -Unique
+            )
 
             [pscustomobject]@{
                 index = [uint32]$candidate.index
@@ -216,6 +232,7 @@ $adapters = @(
                     @($routes | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/1' }).Count -gt 0 -and
                     @($routes | Where-Object { $_.DestinationPrefix -eq '128.0.0.0/1' }).Count -gt 0
                 ))
+                dns_servers = @($dnsServers)
             }
         }
 )
@@ -303,12 +320,60 @@ if ($null -eq $selectedRoute) {
     ConvertTo-Json -InputObject $null -Compress
 } else {
     $interface = Find-PhysicalInterface ([uint32]$selectedRoute.InterfaceIndex)
+    $dnsServers = @(
+        Get-DnsClientServerAddress `
+            -InterfaceIndex ([uint32]$selectedRoute.InterfaceIndex) `
+            -AddressFamily IPv4 `
+            -ErrorAction SilentlyContinue |
+            ForEach-Object { @($_.ServerAddresses) } |
+            Where-Object {
+                try {
+                    ([ipaddress]([string]$_)).AddressFamily -eq
+                        [Net.Sockets.AddressFamily]::InterNetwork
+                } catch {
+                    $false
+                }
+            } |
+            Select-Object -Unique
+    )
+    $fallbackDnsServers = @()
+    $netAdapter = Get-NetAdapter `
+        -IncludeHidden `
+        -InterfaceIndex ([uint32]$selectedRoute.InterfaceIndex) `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -ne $netAdapter -and $null -ne $netAdapter.InterfaceGuid) {
+        $registryPath =
+            "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($netAdapter.InterfaceGuid)"
+        $interfaceSettings = Get-ItemProperty `
+            -LiteralPath $registryPath `
+            -ErrorAction SilentlyContinue
+        if ($null -ne $interfaceSettings) {
+            $fallbackDnsServers = @(
+                @(
+                    ([string]$interfaceSettings.NameServer) -split '[,\s]+'
+                    ([string]$interfaceSettings.DhcpNameServer) -split '[,\s]+'
+                ) |
+                    Where-Object {
+                        try {
+                            ([ipaddress]([string]$_)).AddressFamily -eq
+                                [Net.Sockets.AddressFamily]::InterNetwork
+                        } catch {
+                            $false
+                        }
+                    } |
+                    Select-Object -Unique
+            )
+        }
+    }
     [pscustomobject]@{
         interface_index = [uint32]$selectedRoute.InterfaceIndex
         interface_alias = [string]$interface.alias
         interface_description = [string]$interface.description
         next_hop = [string]$selectedRoute.NextHop
         inferred_from_escape_route = [bool]$inferred
+        dns_servers = @($dnsServers)
+        fallback_dns_servers = @($fallbackDnsServers)
     } | ConvertTo-Json -Compress
 }
 "#;
@@ -463,6 +528,192 @@ try {
 }
 "#;
 
+const APPLY_DNS_POLICY_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+
+$marker = 'tw.layton.rust-vpn-splitter'
+$requestText = [Console]::In.ReadToEnd()
+$request = $requestText | ConvertFrom-Json
+$desired = @($request.rules)
+
+function Normalized-Strings($values) {
+    @($values | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } |
+        Where-Object { $_ -ne '' } | Sort-Object -Unique)
+}
+
+function Same-StringSet($left, $right) {
+    $leftValues = @(Normalized-Strings $left)
+    $rightValues = @(Normalized-Strings $right)
+    if ($leftValues.Count -ne $rightValues.Count) {
+        return $false
+    }
+    return @(Compare-Object -ReferenceObject $leftValues -DifferenceObject $rightValues).Count -eq 0
+}
+
+function Same-Rule($left, $right) {
+    (Same-StringSet $left.Namespace $right.namespaces) -and
+        (Same-StringSet $left.NameServers $right.name_servers)
+}
+
+function Rules-Match($current, $wanted) {
+    if (@($current).Count -ne @($wanted).Count) {
+        return $false
+    }
+    foreach ($candidate in @($wanted)) {
+        $matches = @($current | Where-Object { Same-Rule $_ $candidate })
+        if ($matches.Count -ne 1) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Rule-Spec($rule) {
+    [pscustomobject]@{
+        vpn = $null
+        namespaces = @(Normalized-Strings $rule.Namespace)
+        name_servers = @(Normalized-Strings $rule.NameServers)
+    }
+}
+
+function Add-ManagedRule($rule) {
+    $owner = if ($null -eq $rule.vpn -or [string]::IsNullOrWhiteSpace([string]$rule.vpn)) {
+        'current-network'
+    } else {
+        ([string]$rule.vpn).ToLowerInvariant()
+    }
+    Add-DnsClientNrptRule `
+        -Namespace @($rule.namespaces) `
+        -NameServers @($rule.name_servers) `
+        -Comment $marker `
+        -DisplayName "VPN Splitter: $owner" `
+        -PassThru `
+        -ErrorAction Stop
+}
+
+$allRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue)
+$current = @($allRules | Where-Object { [string]$_.Comment -eq $marker })
+$foreign = @($allRules | Where-Object { [string]$_.Comment -ne $marker })
+
+foreach ($wanted in $desired) {
+    foreach ($namespace in @($wanted.namespaces)) {
+        $conflict = $foreign | Where-Object {
+            @(Normalized-Strings $_.Namespace) -contains
+                ([string]$namespace).Trim().ToLowerInvariant()
+        } | Select-Object -First 1
+        if ($null -ne $conflict) {
+            [pscustomobject]@{
+                ok = $false
+                changed = $false
+                message = "DNS namespace $namespace 已由其他 NRPT 規則管理，為避免覆寫系統或公司原有設定，已停止套用。"
+            } | ConvertTo-Json -Compress
+            exit 1
+        }
+    }
+}
+
+if (Rules-Match $current $desired) {
+    [pscustomobject]@{
+        ok = $true
+        changed = $false
+        message = "DNS 分流規則已是最新狀態。"
+    } | ConvertTo-Json -Compress
+    exit 0
+}
+
+$removed = [Collections.Generic.List[object]]::new()
+$added = [Collections.Generic.List[object]]::new()
+try {
+    foreach ($rule in $current) {
+        $spec = Rule-Spec $rule
+        Remove-DnsClientNrptRule -Name ([string]$rule.Name) -Force -ErrorAction Stop
+        $removed.Add($spec)
+    }
+
+    foreach ($rule in $desired) {
+        $created = Add-ManagedRule $rule
+        $added.Add($created)
+    }
+
+    Clear-DnsClientCache -ErrorAction SilentlyContinue
+    [pscustomobject]@{
+        ok = $true
+        changed = $true
+        message = "已套用 $($desired.Count) 組 DNS 分流規則。"
+    } | ConvertTo-Json -Compress
+} catch {
+    $failure = $_.Exception.Message
+    foreach ($rule in $added) {
+        try {
+            Remove-DnsClientNrptRule -Name ([string]$rule.Name) -Force -ErrorAction Stop
+        } catch {}
+    }
+    foreach ($rule in $removed) {
+        try {
+            Add-ManagedRule $rule | Out-Null
+        } catch {}
+    }
+    Clear-DnsClientCache -ErrorAction SilentlyContinue
+    [pscustomobject]@{
+        ok = $false
+        changed = $false
+        message = "套用 DNS 分流失敗，已嘗試回復原有規則：$failure"
+    } | ConvertTo-Json -Compress
+    exit 1
+}
+"#;
+
+const RESOLVE_DNS_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+
+$requestText = [Console]::In.ReadToEnd()
+$request = $requestText | ConvertFrom-Json
+$errors = [Collections.Generic.List[string]]::new()
+
+foreach ($server in @($request.servers)) {
+    try {
+        $addresses = @(
+            Resolve-DnsName `
+                -Name ([string]$request.hostname) `
+                -Type A `
+                -Server ([string]$server) `
+                -DnsOnly `
+                -QuickTimeout `
+                -ErrorAction Stop |
+                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.IPAddress) } |
+                ForEach-Object { [string]$_.IPAddress } |
+                Sort-Object -Unique
+        )
+        if ($addresses.Count -gt 0) {
+            [pscustomobject]@{
+                ok = $true
+                addresses = @($addresses)
+                message = ""
+            } | ConvertTo-Json -Compress
+            exit 0
+        }
+        $errors.Add("$server 未回傳 IPv4 位址")
+    } catch {
+        $errors.Add("$server：$($_.Exception.Message)")
+    }
+}
+
+[pscustomobject]@{
+    ok = $false
+    addresses = @()
+    message = if ($errors.Count -eq 0) {
+        '沒有可用的 IPv4 DNS server。'
+    } else {
+        $errors -join '；'
+    }
+} | ConvertTo-Json -Compress
+exit 1
+"#;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkAdapter {
     pub index: u32,
@@ -471,6 +722,8 @@ pub struct NetworkAdapter {
     pub status: String,
     pub next_hop: String,
     pub has_default_route: bool,
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
 }
 
 impl NetworkAdapter {
@@ -506,6 +759,10 @@ pub struct InternetGateway {
     pub interface_description: String,
     pub next_hop: String,
     pub inferred_from_escape_route: bool,
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
+    #[serde(default)]
+    pub fallback_dns_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,6 +771,7 @@ pub enum ManagedRoutePurpose {
     #[default]
     Target,
     InternetBypass,
+    VpnDnsServer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -527,6 +785,18 @@ pub struct ManagedRoute {
     pub route_metric: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedDnsRule {
+    pub vpn: Option<VpnKind>,
+    pub namespaces: Vec<String>,
+    pub name_servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsApplyResult {
+    pub changed: bool,
+}
+
 #[derive(Deserialize)]
 struct ApplyResponse {
     ok: bool,
@@ -537,6 +807,31 @@ struct ApplyResponse {
 struct RouteRequest<'a> {
     previous: &'a [ManagedRoute],
     desired: &'a [ManagedRoute],
+}
+
+#[derive(Serialize)]
+struct DnsPolicyRequest<'a> {
+    rules: &'a [ManagedDnsRule],
+}
+
+#[derive(Deserialize)]
+struct DnsApplyResponse {
+    ok: bool,
+    changed: bool,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct DnsResolutionRequest<'a> {
+    hostname: &'a str,
+    servers: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct DnsResolutionResponse {
+    ok: bool,
+    addresses: Vec<String>,
+    message: String,
 }
 
 struct PowerShellOutput {
@@ -656,6 +951,50 @@ pub fn apply_routes(previous: &[ManagedRoute], desired: &[ManagedRoute]) -> Resu
         } else {
             Err(response.message)
         }
+    } else {
+        Err(powershell_failure(&output))
+    }
+}
+
+pub fn apply_dns_policy(rules: &[ManagedDnsRule]) -> Result<DnsApplyResult, String> {
+    let request = serde_json::to_string(&DnsPolicyRequest { rules })
+        .map_err(|error| format!("無法建立 DNS 分流套用要求：{error}"))?;
+    let output = run_powershell(APPLY_DNS_POLICY_SCRIPT, &request)?;
+
+    if let Ok(response) = serde_json::from_str::<DnsApplyResponse>(output.stdout.trim()) {
+        if response.ok && output.success {
+            Ok(DnsApplyResult {
+                changed: response.changed,
+            })
+        } else {
+            Err(response.message)
+        }
+    } else {
+        Err(powershell_failure(&output))
+    }
+}
+
+pub fn resolve_ipv4_with_dns_servers(
+    hostname: &str,
+    servers: &[String],
+) -> Result<Vec<Ipv4Addr>, String> {
+    let request = serde_json::to_string(&DnsResolutionRequest { hostname, servers })
+        .map_err(|error| format!("無法建立 DNS 解析要求：{error}"))?;
+    let output = run_powershell(RESOLVE_DNS_SCRIPT, &request)?;
+
+    if let Ok(response) = serde_json::from_str::<DnsResolutionResponse>(output.stdout.trim()) {
+        if !response.ok || !output.success {
+            return Err(response.message);
+        }
+        response
+            .addresses
+            .into_iter()
+            .map(|address| {
+                address
+                    .parse::<Ipv4Addr>()
+                    .map_err(|error| format!("DNS 回傳無效 IPv4 位址 {address}：{error}"))
+            })
+            .collect()
     } else {
         Err(powershell_failure(&output))
     }
@@ -843,6 +1182,18 @@ function Get-NetRoute {
         }
     }
 }
+
+function Get-DnsClientServerAddress {
+    [CmdletBinding()]
+    param(
+        [uint32]$InterfaceIndex,
+        [string]$AddressFamily
+    )
+
+    if ($InterfaceIndex -eq 43) {
+        [pscustomobject]@{ ServerAddresses = @('203.0.113.53') }
+    }
+}
 "#;
 
     const F5_RAS_APPLY_FIXTURE: &str = r#"
@@ -969,6 +1320,46 @@ function Get-NetRoute {
         }
     )
 }
+
+function Get-DnsClientServerAddress {
+    [CmdletBinding()]
+    param(
+        [uint32]$InterfaceIndex,
+        [string]$AddressFamily
+    )
+
+    if ($InterfaceIndex -eq 7) {
+        [pscustomobject]@{
+            ServerAddresses = @('203.0.113.53', '192.0.2.53')
+        }
+    }
+}
+
+function Get-NetAdapter {
+    [CmdletBinding()]
+    param(
+        [switch]$IncludeHidden,
+        [uint32]$InterfaceIndex
+    )
+
+    if ($InterfaceIndex -eq 7) {
+        [pscustomobject]@{
+            InterfaceGuid = '{00000000-0000-0000-0000-000000000007}'
+        }
+    }
+}
+
+function Get-ItemProperty {
+    [CmdletBinding()]
+    param(
+        [string]$LiteralPath
+    )
+
+    [pscustomobject]@{
+        NameServer = ''
+        DhcpNameServer = '192.0.2.53'
+    }
+}
 "#;
 
     const BEST_EFFORT_CLEANUP_FIXTURE: &str = r#"
@@ -1023,6 +1414,91 @@ function Remove-NetRoute {
 }
 "#;
 
+    const DNS_POLICY_FIXTURE: &str = r#"
+$script:fixtureRules = @(
+    [pscustomobject]@{
+        Name = 'foreign-rule'
+        Namespace = @('foreign.example.test')
+        NameServers = @('192.0.2.200')
+        Comment = 'owned-by-someone-else'
+        DisplayName = 'Foreign rule'
+    }
+)
+$script:nextRule = 0
+
+function Get-DnsClientNrptRule {
+    [CmdletBinding()]
+    param()
+    @($script:fixtureRules)
+}
+
+function Add-DnsClientNrptRule {
+    [CmdletBinding()]
+    param(
+        [string[]]$Namespace,
+        [string[]]$NameServers,
+        [string]$Comment,
+        [string]$DisplayName,
+        [switch]$PassThru
+    )
+    if (
+        -not [string]::IsNullOrWhiteSpace([string]$script:failNamespace) -and
+        @($Namespace) -contains [string]$script:failNamespace
+    ) {
+        [Console]::Error.WriteLine("FIXTURE_ADD_FAILED:$script:failNamespace")
+        throw "fixture rejected namespace $script:failNamespace"
+    }
+    $script:nextRule++
+    $created = [pscustomobject]@{
+        Name = "managed-$($script:nextRule)"
+        Namespace = @($Namespace)
+        NameServers = @($NameServers)
+        Comment = $Comment
+        DisplayName = $DisplayName
+    }
+    $script:fixtureRules += $created
+    [Console]::Error.WriteLine(
+        "FIXTURE_ADD:$($created.Name):$(@($Namespace) -join ','):$(@($NameServers) -join ',')"
+    )
+    if ($PassThru) {
+        $created
+    }
+}
+
+function Remove-DnsClientNrptRule {
+    [CmdletBinding()]
+    param(
+        [string]$Name,
+        [switch]$Force
+    )
+    [Console]::Error.WriteLine("FIXTURE_REMOVE:$Name")
+    $script:fixtureRules = @($script:fixtureRules | Where-Object { $_.Name -ne $Name })
+}
+
+function Clear-DnsClientCache {
+    [CmdletBinding()]
+    param()
+}
+"#;
+
+    const DNS_RESOLUTION_FIXTURE: &str = r#"
+function Resolve-DnsName {
+    [CmdletBinding()]
+    param(
+        [string]$Name,
+        [string]$Type,
+        [string]$Server,
+        [switch]$DnsOnly,
+        [switch]$QuickTimeout
+    )
+    if ($Name -eq 'service.example.test' -and $Server -eq '203.0.113.53') {
+        [pscustomobject]@{ IPAddress = '198.51.100.20' }
+        return
+    }
+    throw "fixture DNS server rejected $Name via $Server"
+}
+"#;
+
     #[test]
     fn discovers_connected_f5_ras_interface() {
         let script = format!("{F5_RAS_FIXTURE}\n{DISCOVER_ADAPTERS_SCRIPT}");
@@ -1043,6 +1519,7 @@ function Remove-NetRoute {
         assert!(connected_f5.matches(VpnKind::F5));
         assert!(connected_f5.is_up());
         assert!(connected_f5.has_default_route);
+        assert_eq!(connected_f5.dns_servers, vec!["203.0.113.53"]);
     }
 
     #[test]
@@ -1204,6 +1681,149 @@ function Remove-NetRoute {
         assert_eq!(gateway.interface_alias, "Wi-Fi");
         assert_eq!(gateway.next_hop, "192.0.2.1");
         assert!(gateway.inferred_from_escape_route);
+        assert_eq!(gateway.dns_servers, vec!["203.0.113.53", "192.0.2.53"]);
+        assert_eq!(gateway.fallback_dns_servers, vec!["192.0.2.53"]);
+    }
+
+    #[test]
+    fn applies_current_network_and_all_three_vpn_dns_rules() {
+        let rules = vec![
+            ManagedDnsRule {
+                vpn: None,
+                namespaces: vec![".".to_owned()],
+                name_servers: vec!["192.0.2.53".to_owned()],
+            },
+            ManagedDnsRule {
+                vpn: Some(VpnKind::FortiClient),
+                namespaces: vec!["forti.example.test".to_owned()],
+                name_servers: vec!["203.0.113.51".to_owned()],
+            },
+            ManagedDnsRule {
+                vpn: Some(VpnKind::F5),
+                namespaces: vec!["f5.example.test".to_owned()],
+                name_servers: vec!["203.0.113.52".to_owned()],
+            },
+            ManagedDnsRule {
+                vpn: Some(VpnKind::Ivanti),
+                namespaces: vec!["ivanti.example.test".to_owned()],
+                name_servers: vec!["203.0.113.53".to_owned()],
+            },
+        ];
+        let request = serde_json::to_string(&DnsPolicyRequest { rules: &rules })
+            .expect("DNS policy request should serialize");
+        let script = format!("{DNS_POLICY_FIXTURE}\n{APPLY_DNS_POLICY_SCRIPT}");
+
+        let output = run_powershell(&script, &request).expect("fixture DNS apply should run");
+
+        assert!(output.success, "{}", powershell_failure(&output));
+        let response: DnsApplyResponse =
+            serde_json::from_str(output.stdout.trim()).expect("fixture output should be JSON");
+        assert!(response.ok, "{}", response.message);
+        assert!(response.changed);
+        assert_eq!(output.stderr.matches("FIXTURE_ADD:").count(), 4);
+        assert!(!output.stderr.contains("FIXTURE_REMOVE:foreign-rule"));
+    }
+
+    #[test]
+    fn dns_cleanup_removes_only_rules_owned_by_this_app() {
+        let request = serde_json::to_string(&DnsPolicyRequest { rules: &[] })
+            .expect("DNS cleanup request should serialize");
+        let prior_rule = r#"
+$script:fixtureRules += [pscustomobject]@{
+    Name = 'previous-managed-rule'
+    Namespace = @('.')
+    NameServers = @('192.0.2.53')
+    Comment = 'tw.layton.rust-vpn-splitter'
+    DisplayName = 'VPN Splitter: current-network'
+}
+"#;
+        let script = format!("{DNS_POLICY_FIXTURE}\n{prior_rule}\n{APPLY_DNS_POLICY_SCRIPT}");
+
+        let output = run_powershell(&script, &request).expect("fixture DNS cleanup should run");
+
+        assert!(output.success, "{}", powershell_failure(&output));
+        let response: DnsApplyResponse =
+            serde_json::from_str(output.stdout.trim()).expect("fixture output should be JSON");
+        assert!(response.ok, "{}", response.message);
+        assert!(response.changed);
+        assert!(
+            output
+                .stderr
+                .contains("FIXTURE_REMOVE:previous-managed-rule")
+        );
+        assert!(!output.stderr.contains("FIXTURE_REMOVE:foreign-rule"));
+    }
+
+    #[test]
+    fn dns_apply_failure_restores_the_previous_managed_policy() {
+        let rules = vec![
+            ManagedDnsRule {
+                vpn: None,
+                namespaces: vec![".".to_owned()],
+                name_servers: vec!["192.0.2.53".to_owned()],
+            },
+            ManagedDnsRule {
+                vpn: Some(VpnKind::F5),
+                namespaces: vec!["fail.example.test".to_owned()],
+                name_servers: vec!["203.0.113.53".to_owned()],
+            },
+        ];
+        let request = serde_json::to_string(&DnsPolicyRequest { rules: &rules })
+            .expect("DNS policy request should serialize");
+        let prior_rule = r#"
+$script:fixtureRules += [pscustomobject]@{
+    Name = 'previous-managed-rule'
+    Namespace = @('.')
+    NameServers = @('192.0.2.99')
+    Comment = 'tw.layton.rust-vpn-splitter'
+    DisplayName = 'VPN Splitter: current-network'
+}
+$script:failNamespace = 'fail.example.test'
+"#;
+        let script = format!("{DNS_POLICY_FIXTURE}\n{prior_rule}\n{APPLY_DNS_POLICY_SCRIPT}");
+
+        let output = run_powershell(&script, &request).expect("fixture DNS apply should run");
+
+        assert!(!output.success);
+        let response: DnsApplyResponse =
+            serde_json::from_str(output.stdout.trim()).expect("fixture output should be JSON");
+        assert!(!response.ok);
+        assert!(!response.changed);
+        assert!(
+            output
+                .stderr
+                .contains("FIXTURE_REMOVE:previous-managed-rule")
+        );
+        assert!(
+            output
+                .stderr
+                .contains("FIXTURE_ADD_FAILED:fail.example.test")
+        );
+        assert!(
+            output.stderr.contains(":.:192.0.2.99"),
+            "the previous catch-all rule must be restored: {}",
+            output.stderr
+        );
+        assert!(!output.stderr.contains("FIXTURE_REMOVE:foreign-rule"));
+    }
+
+    #[test]
+    fn resolves_a_vpn_hostname_through_the_requested_dns_server() {
+        let servers = vec!["203.0.113.53".to_owned()];
+        let request = serde_json::to_string(&DnsResolutionRequest {
+            hostname: "service.example.test",
+            servers: &servers,
+        })
+        .expect("DNS resolution request should serialize");
+        let script = format!("{DNS_RESOLUTION_FIXTURE}\n{RESOLVE_DNS_SCRIPT}");
+
+        let output = run_powershell(&script, &request).expect("fixture DNS query should run");
+
+        assert!(output.success, "{}", powershell_failure(&output));
+        let response: DnsResolutionResponse =
+            serde_json::from_str(output.stdout.trim()).expect("fixture output should be JSON");
+        assert!(response.ok, "{}", response.message);
+        assert_eq!(response.addresses, vec!["198.51.100.20"]);
     }
 
     #[test]

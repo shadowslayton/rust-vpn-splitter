@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
 };
@@ -83,6 +83,7 @@ impl SplitterConfig {
 pub struct ValidatedProfile {
     pub vpn: VpnKind,
     pub networks: Vec<Ipv4Net>,
+    pub hostnames: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,17 +101,18 @@ pub struct ValidationError {
 pub fn validate_config(
     config: &SplitterConfig,
 ) -> Result<Vec<ValidatedProfile>, Vec<ValidationError>> {
-    validate_config_with_resolver(config, resolve_system_ipv4)
+    validate_config_with_resolver(config, |_, hostname| resolve_system_ipv4(hostname))
 }
 
 pub fn validate_config_with_resolver(
     config: &SplitterConfig,
-    mut resolve_hostname: impl FnMut(&str) -> Result<Vec<Ipv4Addr>, String>,
+    mut resolve_hostname: impl FnMut(VpnKind, &str) -> Result<Vec<Ipv4Addr>, String>,
 ) -> Result<Vec<ValidatedProfile>, Vec<ValidationError>> {
     let mut errors = Vec::new();
     let mut validated = Vec::new();
     let mut network_sources = BTreeMap::new();
     let mut resolved_hosts = BTreeMap::new();
+    let mut hostname_owners = BTreeMap::new();
 
     for profile in config.profiles.iter().filter(|profile| profile.enabled) {
         let tokens = target_tokens(&profile.networks).collect::<Vec<_>>();
@@ -124,6 +126,7 @@ pub fn validate_config_with_resolver(
         }
 
         let mut networks = Vec::new();
+        let mut hostnames = BTreeSet::new();
 
         for token in tokens {
             match token.parse::<Ipv4Net>() {
@@ -157,37 +160,54 @@ pub fn validate_config_with_resolver(
                             &mut network_sources,
                         );
                     }
-                    Ok(Host::Domain(hostname)) => match resolved_hosts
-                        .entry(hostname.clone())
-                        .or_insert_with(|| resolve_hostname(&hostname))
-                        .clone()
-                    {
-                        Ok(addresses) if !addresses.is_empty() => {
-                            for address in addresses {
-                                add_network(
-                                    profile.vpn,
-                                    token,
-                                    Ipv4Net::new(address, 32).expect("/32 is valid"),
-                                    &mut networks,
-                                    &mut network_sources,
-                                );
-                            }
+                    Ok(Host::Domain(hostname)) => {
+                        if let Some(existing_vpn) = hostname_owners.get(&hostname)
+                            && *existing_vpn != profile.vpn
+                        {
+                            errors.push(ValidationError {
+                                vpns: vec![*existing_vpn, profile.vpn],
+                                message: format!(
+                                    "網域 {hostname} 同時指定給 {existing_vpn} 與 {}；同一名稱只能使用一組 VPN DNS。",
+                                    profile.vpn
+                                ),
+                            });
+                            continue;
                         }
-                        Ok(_) => errors.push(ValidationError {
-                            vpns: vec![profile.vpn],
-                            message: format!(
-                                "{} 的「{token}」沒有解析到任何 IPv4 位址。",
-                                profile.vpn
-                            ),
-                        }),
-                        Err(error) => errors.push(ValidationError {
-                            vpns: vec![profile.vpn],
-                            message: format!(
-                                "{} 無法解析「{token}」的網域 {hostname}：{error}",
-                                profile.vpn
-                            ),
-                        }),
-                    },
+                        hostname_owners.insert(hostname.clone(), profile.vpn);
+                        hostnames.insert(hostname.clone());
+
+                        match resolved_hosts
+                            .entry((profile.vpn, hostname.clone()))
+                            .or_insert_with(|| resolve_hostname(profile.vpn, &hostname))
+                            .clone()
+                        {
+                            Ok(addresses) if !addresses.is_empty() => {
+                                for address in addresses {
+                                    add_network(
+                                        profile.vpn,
+                                        token,
+                                        Ipv4Net::new(address, 32).expect("/32 is valid"),
+                                        &mut networks,
+                                        &mut network_sources,
+                                    );
+                                }
+                            }
+                            Ok(_) => errors.push(ValidationError {
+                                vpns: vec![profile.vpn],
+                                message: format!(
+                                    "{} 的「{token}」沒有解析到任何 IPv4 位址。",
+                                    profile.vpn
+                                ),
+                            }),
+                            Err(error) => errors.push(ValidationError {
+                                vpns: vec![profile.vpn],
+                                message: format!(
+                                    "{} 無法解析「{token}」的網域 {hostname}：{error}",
+                                    profile.vpn
+                                ),
+                            }),
+                        }
+                    }
                     Ok(Host::Ipv6(_)) => errors.push(ValidationError {
                         vpns: vec![profile.vpn],
                         message: format!("{} 的「{token}」是 IPv6；目前只支援 IPv4。", profile.vpn),
@@ -226,6 +246,7 @@ pub fn validate_config_with_resolver(
         validated.push(ValidatedProfile {
             vpn: profile.vpn,
             networks: minimal_networks,
+            hostnames: hostnames.into_iter().collect(),
         });
     }
 
@@ -282,6 +303,23 @@ pub(crate) fn has_enabled_dns_targets(config: &SplitterConfig) -> bool {
         })
 }
 
+pub(crate) fn configured_dns_hostnames(profile: &VpnProfile) -> Result<Vec<String>, String> {
+    let mut hostnames = BTreeSet::new();
+    for token in target_tokens(&profile.networks) {
+        if token.parse::<Ipv4Net>().is_ok() {
+            continue;
+        }
+        match target_host(token)? {
+            Host::Domain(hostname) => {
+                hostnames.insert(hostname);
+            }
+            Host::Ipv4(_) => {}
+            Host::Ipv6(_) => return Err(format!("「{token}」是 IPv6；目前只支援 IPv4。")),
+        }
+    }
+    Ok(hostnames.into_iter().collect())
+}
+
 fn target_tokens(input: &str) -> impl Iterator<Item = &str> {
     input
         .split(|character: char| character.is_whitespace() || character == ',' || character == ';')
@@ -302,6 +340,10 @@ fn add_network(
 }
 
 fn target_host(token: &str) -> Result<Host<String>, String> {
+    if let Ok(address) = token.parse::<Ipv4Addr>() {
+        return Ok(Host::Ipv4(address));
+    }
+
     let url = if token.contains("://") {
         Url::parse(token)
     } else if token.contains('/') {

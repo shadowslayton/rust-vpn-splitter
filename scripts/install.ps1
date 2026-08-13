@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch] $SkipBuild
+    [switch] $SkipBuild,
+    [string] $CargoTargetDirectory
 )
 
 Set-StrictMode -Version Latest
@@ -31,7 +32,23 @@ function Invoke-CargoBuild {
 }
 
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$sourceExecutable = Join-Path $repositoryRoot 'target\release\rust-vpn-splitter.exe'
+$requestedCargoTargetDirectory = if (-not [string]::IsNullOrWhiteSpace($CargoTargetDirectory)) {
+    $CargoTargetDirectory
+}
+else {
+    $env:CARGO_TARGET_DIR
+}
+$cargoTargetDirectory = if ([string]::IsNullOrWhiteSpace($requestedCargoTargetDirectory)) {
+    Join-Path $repositoryRoot 'target'
+}
+elseif ([IO.Path]::IsPathRooted($requestedCargoTargetDirectory)) {
+    [IO.Path]::GetFullPath($requestedCargoTargetDirectory)
+}
+else {
+    [IO.Path]::GetFullPath((Join-Path $repositoryRoot $requestedCargoTargetDirectory))
+}
+$env:CARGO_TARGET_DIR = $cargoTargetDirectory
+$sourceExecutable = Join-Path $cargoTargetDirectory 'release\rust-vpn-splitter.exe'
 $sourceUninstaller = Join-Path $PSScriptRoot 'uninstall.ps1'
 $installDirectory = Join-Path $env:ProgramFiles 'Rust VPN Splitter'
 $installedExecutable = Join-Path $installDirectory 'rust-vpn-splitter.exe'
@@ -54,7 +71,8 @@ if (-not (Test-IsAdministrator)) {
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
         '-File', ('"{0}"' -f $PSCommandPath),
-        '-SkipBuild'
+        '-SkipBuild',
+        '-CargoTargetDirectory', ('"{0}"' -f $cargoTargetDirectory)
     )
     $startProcessArguments = @{
         FilePath = $powerShell
