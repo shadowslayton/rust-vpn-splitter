@@ -957,9 +957,30 @@ pub fn apply_routes(previous: &[ManagedRoute], desired: &[ManagedRoute]) -> Resu
 }
 
 pub fn apply_dns_policy(rules: &[ManagedDnsRule]) -> Result<DnsApplyResult, String> {
+    apply_dns_policy_with_prestart_cancellation(rules, None)
+}
+
+pub(crate) fn apply_dns_policy_unless_cancelled_before_start(
+    rules: &[ManagedDnsRule],
+    cancellation: &AtomicBool,
+) -> Result<DnsApplyResult, String> {
+    apply_dns_policy_with_prestart_cancellation(rules, Some(cancellation))
+}
+
+fn apply_dns_policy_with_prestart_cancellation(
+    rules: &[ManagedDnsRule],
+    cancellation: Option<&AtomicBool>,
+) -> Result<DnsApplyResult, String> {
     let request = serde_json::to_string(&DnsPolicyRequest { rules })
         .map_err(|error| format!("無法建立 DNS 分流套用要求：{error}"))?;
-    let output = run_powershell(APPLY_DNS_POLICY_SCRIPT, &request)?;
+    let output = match cancellation {
+        Some(cancellation) => run_powershell_mutation_unless_cancelled_before_start(
+            APPLY_DNS_POLICY_SCRIPT,
+            &request,
+            cancellation,
+        )?,
+        None => run_powershell(APPLY_DNS_POLICY_SCRIPT, &request)?,
+    };
 
     if let Ok(response) = serde_json::from_str::<DnsApplyResponse>(output.stdout.trim()) {
         if response.ok && output.success {
@@ -1002,6 +1023,18 @@ pub fn resolve_ipv4_with_dns_servers(
 
 fn run_powershell(script: &str, stdin_text: &str) -> Result<PowerShellOutput, String> {
     run_powershell_with_cancellation(script, stdin_text, None)
+}
+
+fn run_powershell_mutation_unless_cancelled_before_start(
+    script: &str,
+    stdin_text: &str,
+    cancellation: &AtomicBool,
+) -> Result<PowerShellOutput, String> {
+    if cancellation.load(Ordering::Acquire) {
+        Err("PowerShell 工作已取消。".to_owned())
+    } else {
+        run_powershell(script, stdin_text)
+    }
 }
 
 fn run_powershell_with_cancellation(
@@ -1564,6 +1597,27 @@ function Resolve-DnsName {
             "cancellation must stop PowerShell promptly; elapsed={:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn started_powershell_mutation_finishes_after_late_cancellation() {
+        let cancellation = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_cancellation = std::sync::Arc::clone(&cancellation);
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            worker_cancellation.store(true, Ordering::Release);
+        });
+
+        let output = run_powershell_mutation_unless_cancelled_before_start(
+            "Start-Sleep -Milliseconds 300; Write-Output 'finished'",
+            "",
+            &cancellation,
+        )
+        .expect("a PowerShell mutation that already started must finish");
+        canceller.join().expect("cancellation helper must finish");
+
+        assert!(output.success);
+        assert_eq!(output.stdout.trim(), "finished");
     }
 
     #[test]
