@@ -1,13 +1,4 @@
-use std::{
-    io::Write,
-    net::Ipv4Addr,
-    os::windows::process::CommandExt,
-    process::{Command, Stdio},
-    ptr,
-    sync::atomic::{AtomicBool, Ordering},
-    thread,
-    time::Duration,
-};
+use std::{net::Ipv4Addr, ptr, sync::atomic::AtomicBool};
 
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::{
@@ -21,7 +12,10 @@ use windows_sys::Win32::{
 
 use crate::domain::VpnKind;
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+mod powershell;
+
+use self::powershell::{Mutation as PowerShellMutation, Query as PowerShellQuery};
+
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\tw.layton.rust-vpn-splitter";
 
 pub struct SingleInstanceGuard {
@@ -834,17 +828,11 @@ struct DnsResolutionResponse {
     message: String,
 }
 
-struct PowerShellOutput {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
 pub(crate) fn discover_vpn_adapters(
     cancellation: &AtomicBool,
 ) -> Result<Vec<NetworkAdapter>, String> {
     let output =
-        run_powershell_with_cancellation(DISCOVER_ADAPTERS_SCRIPT, "", Some(cancellation))?;
+        powershell::run_query(PowerShellQuery::DiscoverVpnAdapters, "", Some(cancellation))?;
     if !output.success {
         return Err(powershell_failure(&output));
     }
@@ -858,8 +846,11 @@ pub(crate) fn discover_vpn_adapters(
 pub(crate) fn discover_internet_gateway(
     cancellation: &AtomicBool,
 ) -> Result<Option<InternetGateway>, String> {
-    let output =
-        run_powershell_with_cancellation(DISCOVER_INTERNET_GATEWAY_SCRIPT, "", Some(cancellation))?;
+    let output = powershell::run_query(
+        PowerShellQuery::DiscoverInternetGateway,
+        "",
+        Some(cancellation),
+    )?;
     if !output.success {
         return Err(powershell_failure(&output));
     }
@@ -943,7 +934,7 @@ fn sockaddr_ipv4(address: SOCKADDR_INET) -> Option<Ipv4Addr> {
 pub fn apply_routes(previous: &[ManagedRoute], desired: &[ManagedRoute]) -> Result<String, String> {
     let request = serde_json::to_string(&RouteRequest { previous, desired })
         .map_err(|error| format!("無法建立路由套用要求：{error}"))?;
-    let output = run_powershell(APPLY_ROUTES_SCRIPT, &request)?;
+    let output = powershell::run_mutation(PowerShellMutation::ApplyRoutes, &request, None)?;
 
     if let Ok(response) = serde_json::from_str::<ApplyResponse>(output.stdout.trim()) {
         if response.ok && output.success {
@@ -973,14 +964,8 @@ fn apply_dns_policy_with_prestart_cancellation(
 ) -> Result<DnsApplyResult, String> {
     let request = serde_json::to_string(&DnsPolicyRequest { rules })
         .map_err(|error| format!("無法建立 DNS 分流套用要求：{error}"))?;
-    let output = match cancellation {
-        Some(cancellation) => run_powershell_mutation_unless_cancelled_before_start(
-            APPLY_DNS_POLICY_SCRIPT,
-            &request,
-            cancellation,
-        )?,
-        None => run_powershell(APPLY_DNS_POLICY_SCRIPT, &request)?,
-    };
+    let output =
+        powershell::run_mutation(PowerShellMutation::ApplyDnsPolicy, &request, cancellation)?;
 
     if let Ok(response) = serde_json::from_str::<DnsApplyResponse>(output.stdout.trim()) {
         if response.ok && output.success {
@@ -1001,7 +986,7 @@ pub fn resolve_ipv4_with_dns_servers(
 ) -> Result<Vec<Ipv4Addr>, String> {
     let request = serde_json::to_string(&DnsResolutionRequest { hostname, servers })
         .map_err(|error| format!("無法建立 DNS 解析要求：{error}"))?;
-    let output = run_powershell(RESOLVE_DNS_SCRIPT, &request)?;
+    let output = powershell::run_query(PowerShellQuery::ResolveIpv4, &request, None)?;
 
     if let Ok(response) = serde_json::from_str::<DnsResolutionResponse>(output.stdout.trim()) {
         if !response.ok || !output.success {
@@ -1021,127 +1006,7 @@ pub fn resolve_ipv4_with_dns_servers(
     }
 }
 
-fn run_powershell(script: &str, stdin_text: &str) -> Result<PowerShellOutput, String> {
-    run_powershell_with_cancellation(script, stdin_text, None)
-}
-
-fn run_powershell_mutation_unless_cancelled_before_start(
-    script: &str,
-    stdin_text: &str,
-    cancellation: &AtomicBool,
-) -> Result<PowerShellOutput, String> {
-    if cancellation.load(Ordering::Acquire) {
-        Err("PowerShell 工作已取消。".to_owned())
-    } else {
-        run_powershell(script, stdin_text)
-    }
-}
-
-fn run_powershell_with_cancellation(
-    script: &str,
-    stdin_text: &str,
-    cancellation: Option<&AtomicBool>,
-) -> Result<PowerShellOutput, String> {
-    if cancellation.is_some_and(|token| token.load(Ordering::Acquire)) {
-        return Err("PowerShell 工作已取消。".to_owned());
-    }
-
-    ensure_powershell_preserves_adapter_dns(script)?;
-
-    let mut child = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|error| format!("無法啟動 Windows PowerShell：{error}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(stdin_text.as_bytes())
-            .map_err(|error| format!("無法傳送資料給 Windows PowerShell：{error}"))?;
-    }
-
-    if let Some(cancellation) = cancellation {
-        loop {
-            if cancellation.load(Ordering::Acquire) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("PowerShell 工作已取消。".to_owned());
-            }
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(error) => {
-                    return Err(format!("檢查 Windows PowerShell 狀態時發生錯誤：{error}"));
-                }
-            }
-        }
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("等待 Windows PowerShell 時發生錯誤：{error}"))?;
-
-    Ok(PowerShellOutput {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
-}
-
-// Every PowerShell operation crosses this boundary, so a future toggle,
-// refresh, rollback, or shutdown path cannot persist adapter DNS changes.
-fn ensure_powershell_preserves_adapter_dns(script: &str) -> Result<(), String> {
-    let normalized = script.to_ascii_lowercase();
-    let normalized_whitespace = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    let uses_dns_configuration_command = [
-        "set-dnsclientserveraddress",
-        "set-dnsclientdohserveraddress",
-        "set-dnsclientglobalsetting",
-        "setdnsserversearchorder",
-        "setinterfacednssettings",
-    ]
-    .iter()
-    .any(|command| normalized.contains(command));
-    let uses_netsh_dns_mutation = normalized_whitespace.contains("netsh")
-        && [" set dns", " add dns", " delete dns"]
-            .iter()
-            .any(|operation| normalized_whitespace.contains(operation));
-    let writes_interface_dns_registry = [
-        "set-itemproperty",
-        "new-itemproperty",
-        "remove-itemproperty",
-        "reg add",
-        "reg.exe add",
-        "reg delete",
-        "reg.exe delete",
-    ]
-    .iter()
-    .any(|command| normalized.contains(command))
-        && [r"\tcpip\parameters", r"\tcpip6\parameters"]
-            .iter()
-            .any(|path| normalized.contains(path))
-        && normalized.contains("nameserver");
-
-    if uses_dns_configuration_command || uses_netsh_dns_mutation || writes_interface_dns_registry {
-        return Err(
-            "安全限制：程式拒絕執行會修改網卡 DNS 設定的 PowerShell；DNS 分流只能管理本程式的 NRPT 規則。"
-                .to_owned(),
-        );
-    }
-
-    Ok(())
-}
-
-fn powershell_failure(output: &PowerShellOutput) -> String {
+fn powershell_failure(output: &powershell::Output) -> String {
     let stderr = output.stderr.trim();
     let stdout = output.stdout.trim();
 
@@ -1157,6 +1022,7 @@ fn powershell_failure(output: &PowerShellOutput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::atomic::Ordering, thread, time::Duration};
 
     const F5_RAS_FIXTURE: &str = r#"
 $env:APPDATA = 'C:\Fixture\AppData'
@@ -1581,7 +1447,8 @@ function Resolve-DnsName {
     #[test]
     fn discovers_connected_f5_ras_interface() {
         let script = format!("{F5_RAS_FIXTURE}\n{DISCOVER_ADAPTERS_SCRIPT}");
-        let output = run_powershell(&script, "").expect("fixture discovery should run");
+        let output =
+            powershell::run_test_script(&script, "", None).expect("fixture discovery should run");
         assert!(output.success, "{}", powershell_failure(&output));
 
         let adapters: Vec<NetworkAdapter> =
@@ -1605,7 +1472,7 @@ function Resolve-DnsName {
     fn uncancelled_powershell_still_collects_its_output() {
         let cancellation = AtomicBool::new(false);
 
-        let output = run_powershell_with_cancellation(
+        let output = powershell::run_test_script(
             "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); Write-Output 'ready'",
             "",
             Some(&cancellation),
@@ -1618,74 +1485,6 @@ function Resolve-DnsName {
     }
 
     #[test]
-    fn powershell_boundary_refuses_adapter_dns_configuration_changes() {
-        let harmless_simulations = [
-            r#"
-function Set-DnsClientServerAddress {
-    param(
-        [string]$InterfaceAlias,
-        [string[]]$ServerAddresses
-    )
-}
-Set-DnsClientServerAddress `
-    -InterfaceAlias 'Wi-Fi' `
-    -ServerAddresses @('192.0.2.53')
-"#,
-            r#"
-function Set-DnsClientDohServerAddress {
-    param([string]$ServerAddress)
-}
-Set-DnsClientDohServerAddress -ServerAddress '192.0.2.53'
-"#,
-            r#"
-function netsh {
-    param([Parameter(ValueFromRemainingArguments)]$Arguments)
-}
-netsh interface ipv4 set dnsservers name='Wi-Fi' source=dhcp
-"#,
-            r#"
-function Set-ItemProperty {
-    param(
-        [string]$LiteralPath,
-        [string]$Name,
-        [string]$Value
-    )
-}
-Set-ItemProperty `
-    -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{fixture}' `
-    -Name 'NameServer' `
-    -Value '192.0.2.53'
-"#,
-        ];
-
-        for simulation in harmless_simulations {
-            let error = match run_powershell(simulation, "") {
-                Ok(_) => panic!("the PowerShell boundary must reject adapter DNS mutations"),
-                Err(error) => error,
-            };
-
-            assert!(error.contains("網卡 DNS"), "unexpected error: {error}");
-        }
-    }
-
-    #[test]
-    fn production_powershell_scripts_preserve_adapter_dns_configuration() {
-        for (name, script) in [
-            ("adapter discovery", DISCOVER_ADAPTERS_SCRIPT),
-            (
-                "internet gateway discovery",
-                DISCOVER_INTERNET_GATEWAY_SCRIPT,
-            ),
-            ("route policy", APPLY_ROUTES_SCRIPT),
-            ("DNS policy", APPLY_DNS_POLICY_SCRIPT),
-            ("DNS resolution", RESOLVE_DNS_SCRIPT),
-        ] {
-            ensure_powershell_preserves_adapter_dns(script)
-                .unwrap_or_else(|error| panic!("{name} must preserve adapter DNS: {error}"));
-        }
-    }
-
-    #[test]
     fn cancellation_stops_powershell_without_waiting_for_the_script() {
         let cancellation = std::sync::Arc::new(AtomicBool::new(false));
         let worker_cancellation = std::sync::Arc::clone(&cancellation);
@@ -1695,14 +1494,11 @@ Set-ItemProperty `
         });
         let started = std::time::Instant::now();
 
-        let error = match run_powershell_with_cancellation(
-            "Start-Sleep -Seconds 10",
-            "",
-            Some(&cancellation),
-        ) {
-            Ok(_) => panic!("cancelled PowerShell must not complete normally"),
-            Err(error) => error,
-        };
+        let error =
+            match powershell::run_test_script("Start-Sleep -Seconds 10", "", Some(&cancellation)) {
+                Ok(_) => panic!("cancelled PowerShell must not complete normally"),
+                Err(error) => error,
+            };
         canceller.join().expect("cancellation helper must finish");
 
         assert!(error.contains("已取消"), "unexpected error: {error}");
@@ -1722,10 +1518,10 @@ Set-ItemProperty `
             worker_cancellation.store(true, Ordering::Release);
         });
 
-        let output = run_powershell_mutation_unless_cancelled_before_start(
+        let output = powershell::run_test_mutation_script(
             "Start-Sleep -Milliseconds 300; Write-Output 'finished'",
             "",
-            &cancellation,
+            Some(&cancellation),
         )
         .expect("a PowerShell mutation that already started must finish");
         canceller.join().expect("cancellation helper must finish");
@@ -1826,7 +1622,8 @@ Set-ItemProperty `
         })
         .expect("route request should serialize");
         let script = format!("{F5_RAS_APPLY_FIXTURE}\n{APPLY_ROUTES_SCRIPT}");
-        let output = run_powershell(&script, &request).expect("fixture apply should run");
+        let output =
+            powershell::run_test_script(&script, &request, None).expect("fixture apply should run");
 
         assert!(output.success, "{}", powershell_failure(&output));
         let response: ApplyResponse =
@@ -1838,7 +1635,8 @@ Set-ItemProperty `
     fn infers_physical_gateway_from_f5_server_escape_route() {
         let script =
             format!("{F5_FULL_TUNNEL_GATEWAY_FIXTURE}\n{DISCOVER_INTERNET_GATEWAY_SCRIPT}");
-        let output = run_powershell(&script, "").expect("fixture discovery should run");
+        let output =
+            powershell::run_test_script(&script, "", None).expect("fixture discovery should run");
         assert!(output.success, "{}", powershell_failure(&output));
 
         let gateway: Option<InternetGateway> =
@@ -1881,7 +1679,8 @@ Set-ItemProperty `
             .expect("DNS policy request should serialize");
         let script = format!("{DNS_POLICY_FIXTURE}\n{APPLY_DNS_POLICY_SCRIPT}");
 
-        let output = run_powershell(&script, &request).expect("fixture DNS apply should run");
+        let output = powershell::run_test_script(&script, &request, None)
+            .expect("fixture DNS apply should run");
 
         assert!(output.success, "{}", powershell_failure(&output));
         let response: DnsApplyResponse =
@@ -1907,7 +1706,8 @@ $script:fixtureRules += [pscustomobject]@{
 "#;
         let script = format!("{DNS_POLICY_FIXTURE}\n{prior_rule}\n{APPLY_DNS_POLICY_SCRIPT}");
 
-        let output = run_powershell(&script, &request).expect("fixture DNS cleanup should run");
+        let output = powershell::run_test_script(&script, &request, None)
+            .expect("fixture DNS cleanup should run");
 
         assert!(output.success, "{}", powershell_failure(&output));
         let response: DnsApplyResponse =
@@ -1950,7 +1750,8 @@ $script:failNamespace = 'fail.example.test'
 "#;
         let script = format!("{DNS_POLICY_FIXTURE}\n{prior_rule}\n{APPLY_DNS_POLICY_SCRIPT}");
 
-        let output = run_powershell(&script, &request).expect("fixture DNS apply should run");
+        let output = powershell::run_test_script(&script, &request, None)
+            .expect("fixture DNS apply should run");
 
         assert!(!output.success);
         let response: DnsApplyResponse =
@@ -1985,7 +1786,8 @@ $script:failNamespace = 'fail.example.test'
         .expect("DNS resolution request should serialize");
         let script = format!("{DNS_RESOLUTION_FIXTURE}\n{RESOLVE_DNS_SCRIPT}");
 
-        let output = run_powershell(&script, &request).expect("fixture DNS query should run");
+        let output = powershell::run_test_script(&script, &request, None)
+            .expect("fixture DNS query should run");
 
         assert!(output.success, "{}", powershell_failure(&output));
         let response: DnsResolutionResponse =
@@ -2021,7 +1823,8 @@ $script:failNamespace = 'fail.example.test'
         .expect("cleanup request should serialize");
         let script = format!("{BEST_EFFORT_CLEANUP_FIXTURE}\n{APPLY_ROUTES_SCRIPT}");
 
-        let output = run_powershell(&script, &request).expect("fixture cleanup should run");
+        let output = powershell::run_test_script(&script, &request, None)
+            .expect("fixture cleanup should run");
 
         assert!(
             !output.success,

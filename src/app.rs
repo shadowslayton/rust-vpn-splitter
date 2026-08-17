@@ -1052,6 +1052,19 @@ fn cleanup_managed_routes(state: &mut PersistedState) -> Result<(), String> {
     cleanup_managed_routes_with(state, |routes| apply_routes(routes, &[]).map(|_| ()))
 }
 
+fn cleanup_dns_policy_on_shutdown_with(
+    had_active_policy: bool,
+    stale_dns_cleanup_pending: bool,
+    cancelled_pending_operation: bool,
+    cleanup: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if had_active_policy || stale_dns_cleanup_pending || cancelled_pending_operation {
+        cleanup()
+    } else {
+        Ok(())
+    }
+}
+
 pub struct SplitterApp {
     state: PersistedState,
     state_path: PathBuf,
@@ -1065,6 +1078,7 @@ pub struct SplitterApp {
     repaint_context: egui::Context,
     pending_operation: Option<PendingOperation>,
     queued_foreground_action: Option<QueuedForegroundAction>,
+    stale_dns_cleanup_pending: bool,
 }
 
 impl SplitterApp {
@@ -1094,6 +1108,7 @@ impl SplitterApp {
             repaint_context: creation_context.egui_ctx.clone(),
             pending_operation: None,
             queued_foreground_action: None,
+            stale_dns_cleanup_pending: true,
         };
         app.refresh_adapters();
         app
@@ -1196,6 +1211,7 @@ impl SplitterApp {
     }
 
     fn finish_refresh(&mut self, outcome: RefreshOutcome) {
+        let stale_dns_cleanup_completed = outcome.dns_notice.is_ok();
         let route_notice = match outcome.route_notice {
             Ok(reconciled) => {
                 self.state.managed_routes = reconciled.routes;
@@ -1236,6 +1252,9 @@ impl SplitterApp {
                 };
             }
             Err(error) => self.banner = Banner::Error(error),
+        }
+        if stale_dns_cleanup_completed {
+            self.stale_dns_cleanup_pending = false;
         }
     }
 
@@ -1839,9 +1858,11 @@ impl SplitterApp {
 
 impl Drop for SplitterApp {
     fn drop(&mut self) {
+        let mut cancelled_pending_operation = false;
         if let Some(pending) = self.pending_operation.take() {
             if pending.kind.cancel_during_shutdown() {
                 pending.cancel();
+                cancelled_pending_operation = true;
             }
             if let Ok(result) = pending.join() {
                 self.apply_operation_result(result);
@@ -1855,9 +1876,12 @@ impl Drop for SplitterApp {
                 .iter()
                 .any(|profile| profile.enabled);
         let _ = cleanup_managed_routes(&mut self.state);
-        if had_active_policy {
-            let _ = apply_dns_policy(&[]);
-        }
+        let _ = cleanup_dns_policy_on_shutdown_with(
+            had_active_policy,
+            self.stale_dns_cleanup_pending,
+            cancelled_pending_operation,
+            || apply_dns_policy(&[]).map(|_| ()),
+        );
         self.save_to_disk();
     }
 }
@@ -2124,6 +2148,7 @@ mod tests {
             repaint_context: egui::Context::default(),
             pending_operation: None,
             queued_foreground_action: None,
+            stale_dns_cleanup_pending: false,
         }
     }
 
@@ -3219,26 +3244,26 @@ mod tests {
                 .send(())
                 .expect("test observes app shutdown completion");
         });
-        let closed_without_waiting = drop_finished_receiver
-            .recv_timeout(Duration::from_millis(100))
-            .is_ok();
-        if !closed_without_waiting {
-            release_sender
-                .send(())
-                .expect("test releases uncancelled detection after proving it blocked shutdown");
-            drop_finished_receiver
-                .recv()
-                .expect("released shutdown must finish");
-        }
-        let detection_was_cancelled = cancellation_receiver
+        let detection_was_cancelled =
+            match cancellation_receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(cancelled) => cancelled,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    release_sender
+                        .send(())
+                        .expect("test releases detection if shutdown did not cancel it");
+                    cancellation_receiver
+                        .recv()
+                        .expect("released detection must report its shutdown state")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("detection worker ended without reporting its shutdown state")
+                }
+            };
+        drop_finished_receiver
             .recv()
-            .expect("detection worker must report its shutdown state");
+            .expect("shutdown must finish after cancelling detection and cleaning DNS policy");
         dropper.join().expect("shutdown thread must finish");
 
-        assert!(
-            closed_without_waiting,
-            "shutdown must not wait for read-only adapter detection"
-        );
         assert!(
             detection_was_cancelled,
             "shutdown must cancel adapter detection before joining its worker"
@@ -3259,6 +3284,22 @@ mod tests {
         assert!(
             !cleanup_called,
             "shutdown cancellation must not start another PowerShell cleanup"
+        );
+    }
+
+    #[test]
+    fn shutdown_retries_dns_cleanup_after_startup_refresh_is_cancelled() {
+        let mut cleanup_called = false;
+
+        let result = cleanup_dns_policy_on_shutdown_with(false, true, true, || {
+            cleanup_called = true;
+            Ok(())
+        });
+
+        assert_eq!(result, Ok(()));
+        assert!(
+            cleanup_called,
+            "closing immediately after startup must still remove app-owned NRPT rules"
         );
     }
 
