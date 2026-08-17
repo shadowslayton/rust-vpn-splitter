@@ -1046,6 +1046,8 @@ fn run_powershell_with_cancellation(
         return Err("PowerShell 工作已取消。".to_owned());
     }
 
+    ensure_powershell_preserves_adapter_dns(script)?;
+
     let mut child = Command::new("powershell.exe")
         .args([
             "-NoLogo",
@@ -1093,6 +1095,50 @@ fn run_powershell_with_cancellation(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+// Every PowerShell operation crosses this boundary, so a future toggle,
+// refresh, rollback, or shutdown path cannot persist adapter DNS changes.
+fn ensure_powershell_preserves_adapter_dns(script: &str) -> Result<(), String> {
+    let normalized = script.to_ascii_lowercase();
+    let normalized_whitespace = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let uses_dns_configuration_command = [
+        "set-dnsclientserveraddress",
+        "set-dnsclientdohserveraddress",
+        "set-dnsclientglobalsetting",
+        "setdnsserversearchorder",
+        "setinterfacednssettings",
+    ]
+    .iter()
+    .any(|command| normalized.contains(command));
+    let uses_netsh_dns_mutation = normalized_whitespace.contains("netsh")
+        && [" set dns", " add dns", " delete dns"]
+            .iter()
+            .any(|operation| normalized_whitespace.contains(operation));
+    let writes_interface_dns_registry = [
+        "set-itemproperty",
+        "new-itemproperty",
+        "remove-itemproperty",
+        "reg add",
+        "reg.exe add",
+        "reg delete",
+        "reg.exe delete",
+    ]
+    .iter()
+    .any(|command| normalized.contains(command))
+        && [r"\tcpip\parameters", r"\tcpip6\parameters"]
+            .iter()
+            .any(|path| normalized.contains(path))
+        && normalized.contains("nameserver");
+
+    if uses_dns_configuration_command || uses_netsh_dns_mutation || writes_interface_dns_registry {
+        return Err(
+            "安全限制：程式拒絕執行會修改網卡 DNS 設定的 PowerShell；DNS 分流只能管理本程式的 NRPT 規則。"
+                .to_owned(),
+        );
+    }
+
+    Ok(())
 }
 
 fn powershell_failure(output: &PowerShellOutput) -> String {
@@ -1569,6 +1615,74 @@ function Resolve-DnsName {
         assert!(output.success);
         assert_eq!(output.stdout.trim(), "ready");
         assert!(output.stderr.trim().is_empty());
+    }
+
+    #[test]
+    fn powershell_boundary_refuses_adapter_dns_configuration_changes() {
+        let harmless_simulations = [
+            r#"
+function Set-DnsClientServerAddress {
+    param(
+        [string]$InterfaceAlias,
+        [string[]]$ServerAddresses
+    )
+}
+Set-DnsClientServerAddress `
+    -InterfaceAlias 'Wi-Fi' `
+    -ServerAddresses @('192.0.2.53')
+"#,
+            r#"
+function Set-DnsClientDohServerAddress {
+    param([string]$ServerAddress)
+}
+Set-DnsClientDohServerAddress -ServerAddress '192.0.2.53'
+"#,
+            r#"
+function netsh {
+    param([Parameter(ValueFromRemainingArguments)]$Arguments)
+}
+netsh interface ipv4 set dnsservers name='Wi-Fi' source=dhcp
+"#,
+            r#"
+function Set-ItemProperty {
+    param(
+        [string]$LiteralPath,
+        [string]$Name,
+        [string]$Value
+    )
+}
+Set-ItemProperty `
+    -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{fixture}' `
+    -Name 'NameServer' `
+    -Value '192.0.2.53'
+"#,
+        ];
+
+        for simulation in harmless_simulations {
+            let error = match run_powershell(simulation, "") {
+                Ok(_) => panic!("the PowerShell boundary must reject adapter DNS mutations"),
+                Err(error) => error,
+            };
+
+            assert!(error.contains("網卡 DNS"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn production_powershell_scripts_preserve_adapter_dns_configuration() {
+        for (name, script) in [
+            ("adapter discovery", DISCOVER_ADAPTERS_SCRIPT),
+            (
+                "internet gateway discovery",
+                DISCOVER_INTERNET_GATEWAY_SCRIPT,
+            ),
+            ("route policy", APPLY_ROUTES_SCRIPT),
+            ("DNS policy", APPLY_DNS_POLICY_SCRIPT),
+            ("DNS resolution", RESOLVE_DNS_SCRIPT),
+        ] {
+            ensure_powershell_preserves_adapter_dns(script)
+                .unwrap_or_else(|error| panic!("{name} must preserve adapter DNS: {error}"));
+        }
     }
 
     #[test]
