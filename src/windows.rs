@@ -172,6 +172,66 @@ $adapters = @(
             $routes = @(
                 Get-NetRoute -AddressFamily IPv4 -InterfaceIndex $candidate.index -PolicyStore ActiveStore -ErrorAction SilentlyContinue
             )
+            $ipInterface = Get-NetIPInterface `
+                -AddressFamily IPv4 `
+                -InterfaceIndex ([uint32]$candidate.index) `
+                -IncludeAllCompartments `
+                -ErrorAction SilentlyContinue |
+                Sort-Object InterfaceMetric |
+                Select-Object -First 1
+            $interfaceMetric = if ($null -eq $ipInterface) {
+                [uint32]0
+            } else {
+                [uint32]$ipInterface.InterfaceMetric
+            }
+
+            $quarterRoutes = @(
+                foreach ($prefix in @('0.0.0.0/2', '64.0.0.0/2', '128.0.0.0/2', '192.0.0.0/2')) {
+                    $routes |
+                        Where-Object { [string]$_.DestinationPrefix -eq $prefix } |
+                        Sort-Object RouteMetric |
+                        Select-Object -First 1
+                }
+            )
+            $halfRoutes = @(
+                foreach ($prefix in @('0.0.0.0/1', '128.0.0.0/1')) {
+                    $routes |
+                        Where-Object { [string]$_.DestinationPrefix -eq $prefix } |
+                        Sort-Object RouteMetric |
+                        Select-Object -First 1
+                }
+            )
+            $defaultRoutes = @(
+                $routes |
+                    Where-Object { [string]$_.DestinationPrefix -eq '0.0.0.0/0' } |
+                    Sort-Object RouteMetric
+            )
+            $fullTunnelPrefixLength = $null
+            $fullTunnelRoutes = @()
+            if ($quarterRoutes.Count -eq 4) {
+                $fullTunnelPrefixLength = [byte]2
+                $fullTunnelRoutes = $quarterRoutes
+            } elseif ($halfRoutes.Count -eq 2) {
+                $fullTunnelPrefixLength = [byte]1
+                $fullTunnelRoutes = $halfRoutes
+            } elseif ($defaultRoutes.Count -gt 0) {
+                $fullTunnelPrefixLength = [byte]0
+                $fullTunnelRoutes = @($defaultRoutes | Select-Object -First 1)
+            }
+            $fullTunnelPriority = $null
+            if ($null -ne $fullTunnelPrefixLength -and $null -ne $ipInterface) {
+                $effectiveMetric = @(
+                    $fullTunnelRoutes |
+                        ForEach-Object {
+                            [uint32]$_.RouteMetric + [uint32]$interfaceMetric
+                        } |
+                        Measure-Object -Maximum
+                ).Maximum
+                $fullTunnelPriority = [pscustomobject]@{
+                    prefix_length = [byte]$fullTunnelPrefixLength
+                    effective_metric = [uint32]$effectiveMetric
+                }
+            }
 
             $gatewayRoute = $routes |
                 Where-Object {
@@ -192,7 +252,9 @@ $adapters = @(
                     Select-Object -First 1
             }
 
-            $nextHop = if ($null -eq $gatewayRoute) {
+            $nextHop = if ($fullTunnelRoutes.Count -gt 0) {
+                [string]$fullTunnelRoutes[0].NextHop
+            } elseif ($null -eq $gatewayRoute) {
                 '0.0.0.0'
             } else {
                 [string]$gatewayRoute.NextHop
@@ -220,12 +282,7 @@ $adapters = @(
                 description = [string]$candidate.description
                 status = [string]$candidate.status
                 next_hop = $nextHop
-                has_default_route = [bool](@(
-                    $routes | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' }
-                ).Count -gt 0 -or (
-                    @($routes | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/1' }).Count -gt 0 -and
-                    @($routes | Where-Object { $_.DestinationPrefix -eq '128.0.0.0/1' }).Count -gt 0
-                ))
+                full_tunnel_priority = $fullTunnelPriority
                 dns_servers = @($dnsServers)
             }
         }
@@ -314,6 +371,13 @@ if ($null -eq $selectedRoute) {
     ConvertTo-Json -InputObject $null -Compress
 } else {
     $interface = Find-PhysicalInterface ([uint32]$selectedRoute.InterfaceIndex)
+    $routePriority = $null
+    if (-not $inferred -and [string]$selectedRoute.DestinationPrefix -eq '0.0.0.0/0') {
+        $routePriority = [pscustomobject]@{
+            prefix_length = [byte]0
+            effective_metric = [uint32]$selectedRoute.RouteMetric + [uint32]$interface.interface_metric
+        }
+    }
     $dnsServers = @(
         Get-DnsClientServerAddress `
             -InterfaceIndex ([uint32]$selectedRoute.InterfaceIndex) `
@@ -366,6 +430,7 @@ if ($null -eq $selectedRoute) {
         interface_description = [string]$interface.description
         next_hop = [string]$selectedRoute.NextHop
         inferred_from_escape_route = [bool]$inferred
+        route_priority = $routePriority
         dns_servers = @($dnsServers)
         fallback_dns_servers = @($fallbackDnsServers)
     } | ConvertTo-Json -Compress
@@ -708,6 +773,12 @@ foreach ($server in @($request.servers)) {
 exit 1
 "#;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutePriority {
+    pub prefix_length: u8,
+    pub effective_metric: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkAdapter {
     pub index: u32,
@@ -715,7 +786,8 @@ pub struct NetworkAdapter {
     pub description: String,
     pub status: String,
     pub next_hop: String,
-    pub has_default_route: bool,
+    #[serde(default)]
+    pub full_tunnel_priority: Option<RoutePriority>,
     #[serde(default)]
     pub dns_servers: Vec<String>,
 }
@@ -753,6 +825,8 @@ pub struct InternetGateway {
     pub interface_description: String,
     pub next_hop: String,
     pub inferred_from_escape_route: bool,
+    #[serde(default)]
+    pub route_priority: Option<RoutePriority>,
     #[serde(default)]
     pub dns_servers: Vec<String>,
     #[serde(default)]
@@ -1464,8 +1538,57 @@ function Resolve-DnsName {
 
         assert!(connected_f5.matches(VpnKind::F5));
         assert!(connected_f5.is_up());
-        assert!(connected_f5.has_default_route);
+        assert_eq!(
+            connected_f5.full_tunnel_priority,
+            Some(RoutePriority {
+                prefix_length: 0,
+                effective_metric: 1,
+            })
+        );
         assert_eq!(connected_f5.dns_servers, vec!["203.0.113.53"]);
+    }
+
+    #[test]
+    fn discovers_four_quarter_routes_as_a_more_specific_full_tunnel() {
+        let quarter_routes = r#"
+function Get-NetRoute {
+    [CmdletBinding()]
+    param(
+        [string]$AddressFamily,
+        [uint32]$InterfaceIndex,
+        [string]$PolicyStore
+    )
+
+    if ($InterfaceIndex -eq 43) {
+        foreach ($prefix in @('0.0.0.0/2', '64.0.0.0/2', '128.0.0.0/2', '192.0.0.0/2')) {
+            [pscustomobject]@{
+                DestinationPrefix = $prefix
+                NextHop = '0.0.0.0'
+                RouteMetric = [uint32]7
+            }
+        }
+    }
+}
+"#;
+        let script = format!("{F5_RAS_FIXTURE}\n{quarter_routes}\n{DISCOVER_ADAPTERS_SCRIPT}");
+        let output =
+            powershell::run_test_script(&script, "", None).expect("fixture discovery should run");
+        assert!(output.success, "{}", powershell_failure(&output));
+
+        let adapters: Vec<NetworkAdapter> =
+            serde_json::from_str(output.stdout.trim()).expect("fixture output should be JSON");
+        let connected = adapters
+            .iter()
+            .find(|adapter| adapter.index == 43)
+            .expect("connected fixture adapter must be discovered");
+
+        assert_eq!(
+            connected.full_tunnel_priority,
+            Some(RoutePriority {
+                prefix_length: 2,
+                effective_metric: 7,
+            })
+        );
     }
 
     #[test]

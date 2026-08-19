@@ -320,6 +320,31 @@ pub(crate) fn configured_dns_hostnames(profile: &VpnProfile) -> Result<Vec<Strin
     Ok(hostnames.into_iter().collect())
 }
 
+pub(crate) fn configured_static_networks(profile: &VpnProfile) -> Result<Vec<Ipv4Net>, String> {
+    let mut networks = Vec::new();
+    for token in target_tokens(&profile.networks) {
+        match token.parse::<Ipv4Net>() {
+            Ok(network) => {
+                let network = network.trunc();
+                if network.prefix_len() == 0 {
+                    return Err("0.0.0.0/0 不可作為分流目標".to_owned());
+                }
+                networks.push(network);
+            }
+            Err(_) => match target_host(token)? {
+                Host::Ipv4(address) => {
+                    networks.push(Ipv4Net::new(address, 32).expect("/32 is valid"));
+                }
+                Host::Domain(_) => {}
+                Host::Ipv6(_) => {
+                    return Err(format!("「{token}」是 IPv6；目前只支援 IPv4。"));
+                }
+            },
+        }
+    }
+    Ok(networks)
+}
+
 fn target_tokens(input: &str) -> impl Iterator<Item = &str> {
     input
         .split(|character: char| character.is_whitespace() || character == ',' || character == ';')
