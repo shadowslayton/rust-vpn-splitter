@@ -185,20 +185,30 @@ $adapters = @(
                 [uint32]$ipInterface.InterfaceMetric
             }
 
-            $quarterRoutes = @(
-                foreach ($prefix in @('0.0.0.0/2', '64.0.0.0/2', '128.0.0.0/2', '192.0.0.0/2')) {
-                    $routes |
-                        Where-Object { [string]$_.DestinationPrefix -eq $prefix } |
-                        Sort-Object RouteMetric |
-                        Select-Object -First 1
+            $coverageSets = @(
+                [pscustomobject]@{
+                    prefixLength = [byte]4
+                    prefixes = @(
+                        '0.0.0.0/4', '16.0.0.0/4', '32.0.0.0/4', '48.0.0.0/4',
+                        '64.0.0.0/4', '80.0.0.0/4', '96.0.0.0/4', '112.0.0.0/4',
+                        '128.0.0.0/4', '144.0.0.0/4', '160.0.0.0/4', '176.0.0.0/4',
+                        '192.0.0.0/4', '208.0.0.0/4', '224.0.0.0/4', '240.0.0.0/4'
+                    )
                 }
-            )
-            $halfRoutes = @(
-                foreach ($prefix in @('0.0.0.0/1', '128.0.0.0/1')) {
-                    $routes |
-                        Where-Object { [string]$_.DestinationPrefix -eq $prefix } |
-                        Sort-Object RouteMetric |
-                        Select-Object -First 1
+                [pscustomobject]@{
+                    prefixLength = [byte]3
+                    prefixes = @(
+                        '0.0.0.0/3', '32.0.0.0/3', '64.0.0.0/3', '96.0.0.0/3',
+                        '128.0.0.0/3', '160.0.0.0/3', '192.0.0.0/3', '224.0.0.0/3'
+                    )
+                }
+                [pscustomobject]@{
+                    prefixLength = [byte]2
+                    prefixes = @('0.0.0.0/2', '64.0.0.0/2', '128.0.0.0/2', '192.0.0.0/2')
+                }
+                [pscustomobject]@{
+                    prefixLength = [byte]1
+                    prefixes = @('0.0.0.0/1', '128.0.0.0/1')
                 }
             )
             $defaultRoutes = @(
@@ -208,13 +218,22 @@ $adapters = @(
             )
             $fullTunnelPrefixLength = $null
             $fullTunnelRoutes = @()
-            if ($quarterRoutes.Count -eq 4) {
-                $fullTunnelPrefixLength = [byte]2
-                $fullTunnelRoutes = $quarterRoutes
-            } elseif ($halfRoutes.Count -eq 2) {
-                $fullTunnelPrefixLength = [byte]1
-                $fullTunnelRoutes = $halfRoutes
-            } elseif ($defaultRoutes.Count -gt 0) {
+            foreach ($coverageSet in $coverageSets) {
+                $coverageRoutes = @(
+                    foreach ($prefix in @($coverageSet.prefixes)) {
+                        $routes |
+                            Where-Object { [string]$_.DestinationPrefix -eq $prefix } |
+                            Sort-Object RouteMetric |
+                            Select-Object -First 1
+                    }
+                )
+                if ($coverageRoutes.Count -eq @($coverageSet.prefixes).Count) {
+                    $fullTunnelPrefixLength = [byte]$coverageSet.prefixLength
+                    $fullTunnelRoutes = $coverageRoutes
+                    break
+                }
+            }
+            if ($null -eq $fullTunnelPrefixLength -and $defaultRoutes.Count -gt 0) {
                 $fullTunnelPrefixLength = [byte]0
                 $fullTunnelRoutes = @($defaultRoutes | Select-Object -First 1)
             }
@@ -1586,6 +1605,54 @@ function Get-NetRoute {
             connected.full_tunnel_priority,
             Some(RoutePriority {
                 prefix_length: 2,
+                effective_metric: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn discovers_sixteen_sixteenth_routes_as_a_more_specific_full_tunnel() {
+        let sixteenth_routes = r#"
+function Get-NetRoute {
+    [CmdletBinding()]
+    param(
+        [string]$AddressFamily,
+        [uint32]$InterfaceIndex,
+        [string]$PolicyStore
+    )
+
+    if ($InterfaceIndex -eq 43) {
+        foreach ($prefix in @(
+            '0.0.0.0/4', '16.0.0.0/4', '32.0.0.0/4', '48.0.0.0/4',
+            '64.0.0.0/4', '80.0.0.0/4', '96.0.0.0/4', '112.0.0.0/4',
+            '128.0.0.0/4', '144.0.0.0/4', '160.0.0.0/4', '176.0.0.0/4',
+            '192.0.0.0/4', '208.0.0.0/4', '224.0.0.0/4', '240.0.0.0/4'
+        )) {
+            [pscustomobject]@{
+                DestinationPrefix = $prefix
+                NextHop = '0.0.0.0'
+                RouteMetric = [uint32]7
+            }
+        }
+    }
+}
+"#;
+        let script = format!("{F5_RAS_FIXTURE}\n{sixteenth_routes}\n{DISCOVER_ADAPTERS_SCRIPT}");
+        let output =
+            powershell::run_test_script(&script, "", None).expect("fixture discovery should run");
+        assert!(output.success, "{}", powershell_failure(&output));
+
+        let adapters: Vec<NetworkAdapter> =
+            serde_json::from_str(output.stdout.trim()).expect("fixture output should be JSON");
+        let connected = adapters
+            .iter()
+            .find(|adapter| adapter.index == 43)
+            .expect("connected fixture adapter must be discovered");
+
+        assert_eq!(
+            connected.full_tunnel_priority,
+            Some(RoutePriority {
+                prefix_length: 4,
                 effective_metric: 7,
             })
         );

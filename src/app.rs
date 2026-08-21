@@ -36,9 +36,9 @@ const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const ROUTE_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 const ENDPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const SHUTDOWN_CLEANUP_ATTEMPTS: usize = 3;
-// FortiClient versions can preinstall complete /2 or /3 route sets on both
-// the VPN and physical interfaces. Sixteen /4 routes avoid those native keys
-// and remain more specific than either representation of a Full Tunnel.
+// Use /4 coverage when Windows' native priorities cannot preserve the selected
+// fallback. It remains more specific than the /2 or /3 Full Tunnel sets used by
+// some FortiClient versions; native /4 fallback sets are reused instead.
 const INTERNET_BYPASS_PREFIXES: [&str; 16] = [
     "0.0.0.0/4",
     "16.0.0.0/4",
@@ -520,7 +520,7 @@ fn prepare_all_enabled_routes_with_resolver(
             .extend(prepare_validated_profile_routes(config, profile, adapters)?);
     }
 
-    append_internet_bypass_routes(&mut prepared, &full_tunnel_vpns, fallback)?;
+    append_internet_bypass_routes(&mut prepared, config, adapters, &full_tunnel_vpns, fallback)?;
     if let Some(fallback_dns) = fallback_dns.as_deref() {
         append_dns_policy(
             &mut prepared,
@@ -1081,8 +1081,36 @@ fn should_manage_dns_policy(config: &SplitterConfig, full_tunnel_vpns: &[VpnKind
     !full_tunnel_vpns.is_empty() || has_enabled_dns_targets(config)
 }
 
+fn internet_bypass_routes_are_required(
+    config: &SplitterConfig,
+    adapters: &[NetworkAdapter],
+    full_tunnel_vpns: &[VpnKind],
+    fallback: InternetFallback<'_>,
+) -> bool {
+    full_tunnel_vpns.iter().any(|vpn| {
+        let Some(adapter) = config
+            .profile(*vpn)
+            .and_then(|profile| profile.adapter_description.as_ref())
+            .and_then(|description| {
+                adapters.iter().find(|adapter| {
+                    adapter.matches(*vpn)
+                        && &adapter.description == description
+                        && adapter.is_up()
+                        && adapter.full_tunnel_priority.is_some()
+                })
+            })
+        else {
+            return true;
+        };
+        let enabled_tunnel = InternetFallback::Vpn { vpn: *vpn, adapter };
+        !fallback_is_preferred(fallback, enabled_tunnel)
+    })
+}
+
 fn append_internet_bypass_routes(
     prepared: &mut PreparedRoutes,
+    config: &SplitterConfig,
+    adapters: &[NetworkAdapter],
     full_tunnel_vpns: &[VpnKind],
     fallback: Option<InternetFallback<'_>>,
 ) -> Result<(), Vec<String>> {
@@ -1105,26 +1133,32 @@ fn append_internet_bypass_routes(
         )]);
     };
 
-    prepared
-        .routes
-        .extend(INTERNET_BYPASS_PREFIXES.map(|prefix| ManagedRoute {
-            vpn: owner,
-            purpose: ManagedRoutePurpose::InternetBypass,
-            prefix: prefix.to_owned(),
-            interface_index: fallback.interface_index(),
-            next_hop: fallback.next_hop().to_owned(),
-            route_metric: ROUTE_METRIC,
-        }));
-
     let source = if fallback.inferred_from_escape_route() {
         "（由 VPN 保留的伺服器繞行路由推定）"
     } else {
         ""
     };
-    prepared.warnings.push(format!(
-        "{tunnel_state} Full Tunnel；非指定 IPv4 流量會透過 {} 保留原生選路{}。若 VPN 公司策略強制封鎖繞行，連線仍可能受限。",
-        fallback.label(), source
-    ));
+    if internet_bypass_routes_are_required(config, adapters, full_tunnel_vpns, fallback) {
+        prepared
+            .routes
+            .extend(INTERNET_BYPASS_PREFIXES.map(|prefix| ManagedRoute {
+                vpn: owner,
+                purpose: ManagedRoutePurpose::InternetBypass,
+                prefix: prefix.to_owned(),
+                interface_index: fallback.interface_index(),
+                next_hop: fallback.next_hop().to_owned(),
+                route_metric: ROUTE_METRIC,
+            }));
+        prepared.warnings.push(format!(
+            "{tunnel_state} Full Tunnel；非指定 IPv4 流量會透過 {} 保留原生選路{}。若 VPN 公司策略強制封鎖繞行，連線仍可能受限。",
+            fallback.label(), source
+        ));
+    } else {
+        prepared.warnings.push(format!(
+            "{tunnel_state} Full Tunnel；{} 的原生路由已優先處理非指定 IPv4 流量，本程式不會建立重複的全網路 fallback 路由。",
+            fallback.label()
+        ));
+    }
 
     Ok(())
 }
@@ -1314,8 +1348,14 @@ fn desired_routes_for_health_check(
         warnings,
     };
     let fallback = select_internet_fallback(&config, adapters, internet_gateway);
-    append_internet_bypass_routes(&mut prepared, &full_tunnel_vpns, fallback)
-        .map_err(|errors| errors.join("\n"))?;
+    append_internet_bypass_routes(
+        &mut prepared,
+        &config,
+        adapters,
+        &full_tunnel_vpns,
+        fallback,
+    )
+    .map_err(|errors| errors.join("\n"))?;
     if should_manage_dns_policy(&config, &full_tunnel_vpns) {
         let fallback_dns =
             fallback_dns_servers(fallback, adapters).map_err(|errors| errors.join("\n"))?;
@@ -3617,12 +3657,18 @@ mod tests {
                 ));
             }
 
-            let internet_bypass_owner =
-                enabled_full_tunnel_vpns(&self.state.config, &self.adapters)
-                    .first()
-                    .copied();
+            let full_tunnel_vpns = enabled_full_tunnel_vpns(&self.state.config, &self.adapters);
+            let internet_bypass_owner = full_tunnel_vpns.first().copied();
             let internet_fallback =
                 select_internet_fallback(&self.state.config, &self.adapters, Some(&self.gateway));
+            let internet_bypasses_required = internet_fallback.is_some_and(|fallback| {
+                internet_bypass_routes_are_required(
+                    &self.state.config,
+                    &self.adapters,
+                    &full_tunnel_vpns,
+                    fallback,
+                )
+            });
 
             for vpn in VpnKind::ALL {
                 let profile = self.state.config.profile(vpn).expect("profile exists");
@@ -3662,13 +3708,19 @@ mod tests {
                 if Some(vpn) == internet_bypass_owner {
                     let fallback = internet_fallback
                         .ok_or_else(|| format!("{vpn} has no unmatched-traffic fallback"))?;
-                    if bypasses.len() != INTERNET_BYPASS_PREFIXES.len()
-                        || bypasses.iter().any(|route| {
-                            route.interface_index != fallback.interface_index()
-                                || route.next_hop != fallback.next_hop()
-                        })
-                    {
-                        return Err(format!("{vpn} has incomplete or stale internet bypasses"));
+                    if internet_bypasses_required {
+                        if bypasses.len() != INTERNET_BYPASS_PREFIXES.len()
+                            || bypasses.iter().any(|route| {
+                                route.interface_index != fallback.interface_index()
+                                    || route.next_hop != fallback.next_hop()
+                            })
+                        {
+                            return Err(format!("{vpn} has incomplete or stale internet bypasses"));
+                        }
+                    } else if !bypasses.is_empty() {
+                        return Err(format!(
+                            "{vpn} duplicates a natively preferred fallback route set"
+                        ));
                     }
                 } else if !bypasses.is_empty() {
                     return Err(format!("{vpn} unexpectedly owns shared internet bypasses"));
@@ -4931,6 +4983,88 @@ mod tests {
             disconnected_outcome,
             RouteHealthOutcome::Updated { .. }
         ));
+    }
+
+    #[test]
+    fn route_health_reuses_a_preferred_unmanaged_vpn_without_duplicate_bypass_routes() {
+        use std::cell::RefCell;
+
+        let mut app = full_tunnel_app(VpnKind::F5);
+        let config = enabled_full_tunnel_config(&app, VpnKind::F5);
+        let physical_routes = app
+            .prepare_all_enabled_routes(&config)
+            .expect("the initial physical fallback must be prepared")
+            .routes;
+        let forti_adapter = NetworkAdapter {
+            index: 44,
+            name: "FortiClient fallback".to_owned(),
+            description: "Fortinet SSL VPN Virtual Ethernet Adapter".to_owned(),
+            status: "Up".to_owned(),
+            next_hop: "10.88.201.2".to_owned(),
+            full_tunnel_priority: Some(RoutePriority {
+                prefix_length: 4,
+                effective_metric: 2,
+            }),
+            dns_servers: vec!["10.1.101.31".to_owned()],
+        };
+        let native_forti_routes = INTERNET_BYPASS_PREFIXES.map(|prefix| ManagedRoute {
+            vpn: VpnKind::FortiClient,
+            purpose: ManagedRoutePurpose::InternetBypass,
+            prefix: prefix.to_owned(),
+            interface_index: forti_adapter.index,
+            next_hop: forti_adapter.next_hop.clone(),
+            route_metric: 1,
+        });
+        app.adapters.push(forti_adapter);
+
+        let route_table = RefCell::new(FakeRouteTable {
+            routes: physical_routes
+                .iter()
+                .cloned()
+                .chain(native_forti_routes.iter().cloned())
+                .collect(),
+        });
+        let applied_dns_rules = RefCell::new(Vec::new());
+
+        let outcome = evaluate_route_health_with(
+            physical_routes.clone(),
+            config,
+            physical_routes,
+            app.adapters.clone(),
+            app.internet_gateway.clone(),
+            |previous, desired| route_table.borrow_mut().apply(previous, desired),
+            |rules| {
+                *applied_dns_rules.borrow_mut() = rules.to_vec();
+                Ok(true)
+            },
+        );
+
+        let routes = match outcome {
+            RouteHealthOutcome::Updated { routes, .. } => routes,
+            other => panic!("the native Forti fallback must be reusable: {other:?}"),
+        };
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.purpose != ManagedRoutePurpose::InternetBypass),
+            "a natively preferred fallback must not receive duplicate coverage routes"
+        );
+        assert!(native_forti_routes.iter().all(|native| {
+            route_table
+                .borrow()
+                .routes
+                .iter()
+                .any(|route| FakeRouteTable::same_os_route(route, native))
+        }));
+        assert!(route_table.borrow().routes.iter().all(|route| {
+            route.purpose != ManagedRoutePurpose::InternetBypass || route.interface_index == 44
+        }));
+        assert_eq!(applied_dns_rules.borrow().len(), 1);
+        assert_eq!(applied_dns_rules.borrow()[0].namespaces, vec!["."]);
+        assert_eq!(
+            applied_dns_rules.borrow()[0].name_servers,
+            vec!["10.1.101.31"]
+        );
     }
 
     #[test]
