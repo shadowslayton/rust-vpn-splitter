@@ -36,17 +36,26 @@ const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const ROUTE_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 const ENDPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const SHUTDOWN_CLEANUP_ATTEMPTS: usize = 3;
-// FortiClient can preinstall all four /2 route keys on both the VPN and
-// physical interfaces. Eight /3 routes avoid those keys and win by prefix.
-const INTERNET_BYPASS_PREFIXES: [&str; 8] = [
-    "0.0.0.0/3",
-    "32.0.0.0/3",
-    "64.0.0.0/3",
-    "96.0.0.0/3",
-    "128.0.0.0/3",
-    "160.0.0.0/3",
-    "192.0.0.0/3",
-    "224.0.0.0/3",
+// FortiClient versions can preinstall complete /2 or /3 route sets on both
+// the VPN and physical interfaces. Sixteen /4 routes avoid those native keys
+// and remain more specific than either representation of a Full Tunnel.
+const INTERNET_BYPASS_PREFIXES: [&str; 16] = [
+    "0.0.0.0/4",
+    "16.0.0.0/4",
+    "32.0.0.0/4",
+    "48.0.0.0/4",
+    "64.0.0.0/4",
+    "80.0.0.0/4",
+    "96.0.0.0/4",
+    "112.0.0.0/4",
+    "128.0.0.0/4",
+    "144.0.0.0/4",
+    "160.0.0.0/4",
+    "176.0.0.0/4",
+    "192.0.0.0/4",
+    "208.0.0.0/4",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
 ];
 const MIN_PROFILE_CARD_WIDTH: f32 = 340.0;
 const MIN_PROFILE_CARD_CONTENT_HEIGHT: f32 = 300.0;
@@ -2703,22 +2712,31 @@ mod tests {
     }
 
     #[test]
-    fn forticlient_native_quarter_routes_do_not_block_full_tunnel_enable() {
+    fn forticlient_native_eighth_routes_do_not_block_full_tunnel_enable() {
         use std::cell::RefCell;
 
         let app = full_tunnel_app(VpnKind::FortiClient);
         let config = enabled_full_tunnel_config(&app, VpnKind::FortiClient);
-        let native_quarter_routes =
-            ["0.0.0.0/2", "64.0.0.0/2", "128.0.0.0/2", "192.0.0.0/2"].map(|prefix| ManagedRoute {
-                vpn: VpnKind::FortiClient,
-                purpose: ManagedRoutePurpose::InternetBypass,
-                prefix: prefix.to_owned(),
-                interface_index: 7,
-                next_hop: "192.0.2.1".to_owned(),
-                route_metric: 0,
-            });
+        let native_eighth_routes = [
+            "0.0.0.0/3",
+            "32.0.0.0/3",
+            "64.0.0.0/3",
+            "96.0.0.0/3",
+            "128.0.0.0/3",
+            "160.0.0.0/3",
+            "192.0.0.0/3",
+            "224.0.0.0/3",
+        ]
+        .map(|prefix| ManagedRoute {
+            vpn: VpnKind::FortiClient,
+            purpose: ManagedRoutePurpose::InternetBypass,
+            prefix: prefix.to_owned(),
+            interface_index: 7,
+            next_hop: "192.0.2.1".to_owned(),
+            route_metric: 0,
+        });
         let route_table = RefCell::new(FakeRouteTable {
-            routes: native_quarter_routes.to_vec(),
+            routes: native_eighth_routes.to_vec(),
         });
 
         let applied = apply_policy_transaction_with(
@@ -2733,7 +2751,7 @@ mod tests {
             |previous, desired| route_table.borrow_mut().apply(previous, desired),
             |_| Ok(false),
         )
-        .expect("FortiClient's native /2 routes must not collide with physical bypass routes");
+        .expect("FortiClient's native /3 routes must not collide with physical bypass routes");
 
         let bypass_prefixes = applied
             .prepared
@@ -2742,20 +2760,8 @@ mod tests {
             .filter(|route| route.purpose == ManagedRoutePurpose::InternetBypass)
             .map(|route| route.prefix.as_str())
             .collect::<BTreeSet<_>>();
-        assert_eq!(
-            bypass_prefixes,
-            BTreeSet::from([
-                "0.0.0.0/3",
-                "32.0.0.0/3",
-                "64.0.0.0/3",
-                "96.0.0.0/3",
-                "128.0.0.0/3",
-                "160.0.0.0/3",
-                "192.0.0.0/3",
-                "224.0.0.0/3",
-            ])
-        );
-        assert!(native_quarter_routes.iter().all(|native| {
+        assert_eq!(bypass_prefixes, BTreeSet::from(INTERNET_BYPASS_PREFIXES));
+        assert!(native_eighth_routes.iter().all(|native| {
             route_table
                 .borrow()
                 .routes
@@ -4945,7 +4951,7 @@ mod tests {
                 next_hop: "0.0.0.0".to_owned(),
                 route_metric: ROUTE_METRIC,
             }));
-            // FortiClient can implement Full Tunnel with four /2 routes on
+            // FortiClient can implement Full Tunnel with /2 or /3 routes on
             // both interfaces. The managed bypass must be more specific so
             // it neither collides with those route keys nor loses by metric.
             for prefix in INTERNET_BYPASS_PREFIXES {
@@ -5200,7 +5206,7 @@ mod tests {
                 .routes;
             let existing_routes = current_routes
                 .iter()
-                .filter(|route| route.prefix != "64.0.0.0/3")
+                .filter(|route| route.prefix != "64.0.0.0/4")
                 .cloned()
                 .collect::<Vec<_>>();
             let mut apply_calls = 0;
@@ -5214,7 +5220,7 @@ mod tests {
                 |_, desired| {
                     apply_calls += 1;
                     assert_eq!(desired.len(), current_routes.len());
-                    assert!(desired.iter().any(|route| route.prefix == "64.0.0.0/3"));
+                    assert!(desired.iter().any(|route| route.prefix == "64.0.0.0/4"));
                     Ok(())
                 },
                 |_| Ok(false),
