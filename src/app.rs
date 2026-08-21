@@ -24,8 +24,9 @@ use crate::{
     },
     windows::{
         InternetGateway, ManagedDnsRule, ManagedRoute, ManagedRoutePurpose, NetworkAdapter,
-        RoutePriority, apply_dns_policy, apply_dns_policy_unless_cancelled_before_start,
-        apply_routes, discover_internet_gateway, discover_vpn_adapters, existing_managed_routes,
+        RoutePriority, RouteTableFingerprint, apply_dns_policy,
+        apply_dns_policy_unless_cancelled_before_start, apply_routes, discover_internet_gateway,
+        discover_vpn_adapters, existing_managed_routes, inspect_ipv4_route_table,
         resolve_ipv4_with_dns_servers,
     },
 };
@@ -252,7 +253,10 @@ enum OperationResult {
     Refresh(RefreshOutcome),
     Toggle(ToggleOutcome),
     RefreshDns(DnsRefreshOutcome),
-    RouteHealth(RouteHealthOutcome),
+    RouteHealth {
+        outcome: RouteHealthOutcome,
+        route_table_fingerprint: Option<RouteTableFingerprint>,
+    },
 }
 
 struct PendingOperation {
@@ -1424,23 +1428,44 @@ fn evaluate_route_health_with(
     }
 }
 
+fn endpoint_refresh_required(
+    scheduled_refresh: bool,
+    previous_fingerprint: Option<RouteTableFingerprint>,
+    current_fingerprint: RouteTableFingerprint,
+) -> bool {
+    scheduled_refresh || previous_fingerprint != Some(current_fingerprint)
+}
+
 fn run_route_health(
     current_routes: Vec<ManagedRoute>,
     config: SplitterConfig,
-    refresh_endpoints: bool,
+    scheduled_endpoint_refresh: bool,
+    previous_route_table_fingerprint: Option<RouteTableFingerprint>,
     cancellation: Arc<AtomicBool>,
 ) -> OperationResult {
-    let existing_routes = match existing_managed_routes(&current_routes) {
-        Ok(routes) => routes,
+    let route_table = match inspect_ipv4_route_table(&current_routes) {
+        Ok(inspection) => inspection,
         Err(error) => {
-            return OperationResult::RouteHealth(RouteHealthOutcome::Failed(format!(
-                "無法核對 ActiveStore 分流路由；將稍後重試：{error}"
-            )));
+            return OperationResult::RouteHealth {
+                outcome: RouteHealthOutcome::Failed(format!(
+                    "無法核對 ActiveStore 分流路由；將稍後重試：{error}"
+                )),
+                route_table_fingerprint: None,
+            };
         }
     };
+    let route_table_fingerprint = route_table.fingerprint;
+    let refresh_endpoints = endpoint_refresh_required(
+        scheduled_endpoint_refresh,
+        previous_route_table_fingerprint,
+        route_table_fingerprint,
+    );
 
-    if !refresh_endpoints && routes_match(&existing_routes, &current_routes) {
-        return OperationResult::RouteHealth(RouteHealthOutcome::Healthy);
+    if !refresh_endpoints && routes_match(&route_table.existing_managed_routes, &current_routes) {
+        return OperationResult::RouteHealth {
+            outcome: RouteHealthOutcome::Healthy,
+            route_table_fingerprint: Some(route_table_fingerprint),
+        };
     }
 
     let (adapters, internet_gateway) = thread::scope(|scope| {
@@ -1459,29 +1484,38 @@ fn run_route_health(
     let adapters = match adapters {
         Ok(adapters) => adapters,
         Err(error) => {
-            return OperationResult::RouteHealth(RouteHealthOutcome::Failed(format!(
-                "自動修復前無法重新偵測 VPN 介面：{error}"
-            )));
+            return OperationResult::RouteHealth {
+                outcome: RouteHealthOutcome::Failed(format!(
+                    "自動修復前無法重新偵測 VPN 介面：{error}"
+                )),
+                route_table_fingerprint: Some(route_table_fingerprint),
+            };
         }
     };
     let internet_gateway = match internet_gateway {
         Ok(gateway) => gateway,
         Err(error) => {
-            return OperationResult::RouteHealth(RouteHealthOutcome::Failed(format!(
-                "自動修復前無法重新偵測一般網路閘道：{error}"
-            )));
+            return OperationResult::RouteHealth {
+                outcome: RouteHealthOutcome::Failed(format!(
+                    "自動修復前無法重新偵測一般網路閘道：{error}"
+                )),
+                route_table_fingerprint: Some(route_table_fingerprint),
+            };
         }
     };
 
-    OperationResult::RouteHealth(evaluate_route_health_with(
-        current_routes,
-        config,
-        existing_routes,
-        adapters,
-        internet_gateway,
-        |previous, desired| apply_routes(previous, desired).map(|_| ()),
-        |rules| apply_dns_policy(rules).map(|result| result.changed),
-    ))
+    OperationResult::RouteHealth {
+        outcome: evaluate_route_health_with(
+            current_routes,
+            config,
+            route_table.existing_managed_routes,
+            adapters,
+            internet_gateway,
+            |previous, desired| apply_routes(previous, desired).map(|_| ()),
+            |rules| apply_dns_policy(rules).map(|result| result.changed),
+        ),
+        route_table_fingerprint: Some(route_table_fingerprint),
+    }
 }
 
 fn disable_all_profiles(state: &mut PersistedState) {
@@ -1544,6 +1578,7 @@ pub struct SplitterApp {
     next_dns_refresh_at: Instant,
     next_route_health_at: Instant,
     next_endpoint_refresh_at: Instant,
+    route_table_fingerprint: Option<RouteTableFingerprint>,
     repaint_context: egui::Context,
     pending_operation: Option<PendingOperation>,
     queued_foreground_action: Option<QueuedForegroundAction>,
@@ -1574,6 +1609,7 @@ impl SplitterApp {
             next_dns_refresh_at: Instant::now(),
             next_route_health_at: Instant::now(),
             next_endpoint_refresh_at: Instant::now(),
+            route_table_fingerprint: None,
             repaint_context: creation_context.egui_ctx.clone(),
             pending_operation: None,
             queued_foreground_action: None,
@@ -1675,7 +1711,10 @@ impl SplitterApp {
             OperationResult::Refresh(outcome) => self.finish_refresh(outcome),
             OperationResult::Toggle(outcome) => self.finish_toggle(outcome),
             OperationResult::RefreshDns(outcome) => self.finish_dns_refresh(outcome),
-            OperationResult::RouteHealth(outcome) => self.finish_route_health(outcome),
+            OperationResult::RouteHealth {
+                outcome,
+                route_table_fingerprint,
+            } => self.finish_route_health(outcome, route_table_fingerprint),
         }
     }
 
@@ -1836,7 +1875,14 @@ impl SplitterApp {
         }
     }
 
-    fn finish_route_health(&mut self, outcome: RouteHealthOutcome) {
+    fn finish_route_health(
+        &mut self,
+        outcome: RouteHealthOutcome,
+        route_table_fingerprint: Option<RouteTableFingerprint>,
+    ) {
+        if let Some(fingerprint) = route_table_fingerprint {
+            self.route_table_fingerprint = Some(fingerprint);
+        }
         match outcome {
             RouteHealthOutcome::Healthy => {}
             RouteHealthOutcome::Updated {
@@ -2253,8 +2299,15 @@ impl SplitterApp {
         }
         let current_routes = self.state.managed_routes.clone();
         let config = self.state.config.clone();
+        let previous_route_table_fingerprint = self.route_table_fingerprint;
         self.start_operation(OperationKind::RouteHealth, move |cancellation| {
-            run_route_health(current_routes, config, refresh_endpoints, cancellation)
+            run_route_health(
+                current_routes,
+                config,
+                refresh_endpoints,
+                previous_route_table_fingerprint,
+                cancellation,
+            )
         });
     }
 
@@ -2598,6 +2651,7 @@ mod tests {
             next_dns_refresh_at: Instant::now(),
             next_route_health_at: Instant::now(),
             next_endpoint_refresh_at: Instant::now(),
+            route_table_fingerprint: None,
             repaint_context: egui::Context::default(),
             pending_operation: None,
             queued_foreground_action: None,
@@ -4051,7 +4105,10 @@ mod tests {
         app.pending_operation = Some(PendingOperation::spawn(
             OperationKind::RouteHealth,
             app.repaint_context.clone(),
-            |_| OperationResult::RouteHealth(RouteHealthOutcome::Healthy),
+            |_| OperationResult::RouteHealth {
+                outcome: RouteHealthOutcome::Healthy,
+                route_table_fingerprint: None,
+            },
         ));
         assert!(
             !app.user_interface_busy(),
@@ -4115,15 +4172,18 @@ mod tests {
         stale_profile.enabled = false;
         stale_profile.networks = "stale-snapshot.example.test".to_owned();
 
-        app.finish_route_health(RouteHealthOutcome::Updated {
-            config: stale_health_config,
-            routes: Vec::new(),
-            adapters: app.adapters.clone(),
-            internet_gateway: app.internet_gateway.clone().map(Box::new),
-            repaired: false,
-            disabled_vpns: vec![VpnKind::F5],
-            warnings: vec!["F5 disconnected".to_owned()],
-        });
+        app.finish_route_health(
+            RouteHealthOutcome::Updated {
+                config: stale_health_config,
+                routes: Vec::new(),
+                adapters: app.adapters.clone(),
+                internet_gateway: app.internet_gateway.clone().map(Box::new),
+                repaired: false,
+                disabled_vpns: vec![VpnKind::F5],
+                warnings: vec!["F5 disconnected".to_owned()],
+            },
+            None,
+        );
 
         let profile = app
             .state
@@ -4631,6 +4691,21 @@ mod tests {
             needs_periodic_route_refresh(&config),
             "route drift can affect CIDR-only profiles too"
         );
+    }
+
+    #[test]
+    fn route_table_change_forces_endpoint_refresh_before_periodic_deadline() {
+        let previous = RouteTableFingerprint::from_test_value(7);
+        let unchanged = RouteTableFingerprint::from_test_value(7);
+        let forti_connected = RouteTableFingerprint::from_test_value(8);
+
+        assert!(!endpoint_refresh_required(false, Some(previous), unchanged));
+        assert!(endpoint_refresh_required(
+            false,
+            Some(previous),
+            forti_connected
+        ));
+        assert!(endpoint_refresh_required(true, Some(previous), unchanged));
     }
 
     #[test]

@@ -1,4 +1,10 @@
-use std::{net::Ipv4Addr, ptr, sync::atomic::AtomicBool};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    net::Ipv4Addr,
+    ptr,
+    sync::atomic::AtomicBool,
+};
 
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::{
@@ -798,6 +804,22 @@ pub struct RoutePriority {
     pub effective_metric: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RouteTableFingerprint(u64);
+
+impl RouteTableFingerprint {
+    #[cfg(test)]
+    pub(crate) const fn from_test_value(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RouteTableInspection {
+    pub existing_managed_routes: Vec<ManagedRoute>,
+    pub fingerprint: RouteTableFingerprint,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkAdapter {
     pub index: u32,
@@ -952,11 +974,7 @@ pub(crate) fn discover_internet_gateway(
         .map_err(|error| format!("無法解析一般網路閘道資料：{error}"))
 }
 
-pub fn existing_managed_routes(routes: &[ManagedRoute]) -> Result<Vec<ManagedRoute>, String> {
-    if routes.is_empty() {
-        return Ok(Vec::new());
-    }
-
+fn with_ipv4_route_rows<T>(inspect: impl FnOnce(&[MIB_IPFORWARD_ROW2]) -> T) -> Result<T, String> {
     let mut table = ptr::null_mut();
     // SAFETY: `table` is a valid out pointer. On success Windows allocates the
     // returned table, which is held by `MibTableGuard` and released exactly once.
@@ -978,11 +996,28 @@ pub fn existing_managed_routes(routes: &[ManagedRoute]) -> Result<Vec<ManagedRou
         std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
     };
 
-    Ok(routes
-        .iter()
-        .filter(|route| rows.iter().any(|row| route_row_matches(row, route)))
-        .cloned()
-        .collect())
+    Ok(inspect(rows))
+}
+
+pub(crate) fn inspect_ipv4_route_table(
+    routes: &[ManagedRoute],
+) -> Result<RouteTableInspection, String> {
+    with_ipv4_route_rows(|rows| RouteTableInspection {
+        existing_managed_routes: routes
+            .iter()
+            .filter(|route| rows.iter().any(|row| route_row_matches(row, route)))
+            .cloned()
+            .collect(),
+        fingerprint: route_rows_fingerprint(rows),
+    })
+}
+
+pub fn existing_managed_routes(routes: &[ManagedRoute]) -> Result<Vec<ManagedRoute>, String> {
+    if routes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    inspect_ipv4_route_table(routes).map(|inspection| inspection.existing_managed_routes)
 }
 
 struct MibTableGuard(*mut MIB_IPFORWARD_TABLE2);
@@ -1009,6 +1044,35 @@ fn route_row_matches(row: &MIB_IPFORWARD_ROW2, route: &ManagedRoute) -> bool {
         && row.Metric == u32::from(route.route_metric)
         && format!("{destination}/{}", row.DestinationPrefix.PrefixLength) == route.prefix
         && next_hop.to_string() == route.next_hop
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct RouteFingerprintRow {
+    destination: Ipv4Addr,
+    prefix_length: u8,
+    interface_index: u32,
+    next_hop: Ipv4Addr,
+    metric: u32,
+}
+
+fn route_rows_fingerprint(rows: &[MIB_IPFORWARD_ROW2]) -> RouteTableFingerprint {
+    let mut stable_rows = rows
+        .iter()
+        .filter_map(|row| {
+            Some(RouteFingerprintRow {
+                destination: sockaddr_ipv4(row.DestinationPrefix.Prefix)?,
+                prefix_length: row.DestinationPrefix.PrefixLength,
+                interface_index: row.InterfaceIndex,
+                next_hop: sockaddr_ipv4(row.NextHop)?,
+                metric: row.Metric,
+            })
+        })
+        .collect::<Vec<_>>();
+    stable_rows.sort_unstable();
+
+    let mut hasher = DefaultHasher::new();
+    stable_rows.hash(&mut hasher);
+    RouteTableFingerprint(hasher.finish())
 }
 
 fn sockaddr_ipv4(address: SOCKADDR_INET) -> Option<Ipv4Addr> {
@@ -1775,6 +1839,44 @@ function Get-NetRoute {
         assert!(
             !route_row_matches(&row, &route),
             "a route modified by another process must not be mistaken for our exact route"
+        );
+    }
+
+    #[test]
+    fn route_table_fingerprint_detects_an_unmanaged_vpn_route_change() {
+        fn sockaddr(address: Ipv4Addr) -> SOCKADDR_INET {
+            let mut value = SOCKADDR_INET::default();
+            value.Ipv4.sin_family = AF_INET;
+            value.Ipv4.sin_addr.S_un.S_addr = u32::from(address).to_be();
+            value
+        }
+
+        let physical_default = MIB_IPFORWARD_ROW2 {
+            InterfaceIndex: 7,
+            DestinationPrefix: windows_sys::Win32::NetworkManagement::IpHelper::IP_ADDRESS_PREFIX {
+                Prefix: sockaddr(Ipv4Addr::UNSPECIFIED),
+                PrefixLength: 0,
+            },
+            NextHop: sockaddr(Ipv4Addr::new(192, 0, 2, 1)),
+            Metric: 25,
+            ..Default::default()
+        };
+        let forti_default = MIB_IPFORWARD_ROW2 {
+            InterfaceIndex: 19,
+            NextHop: sockaddr(Ipv4Addr::new(10, 88, 201, 2)),
+            Metric: 0,
+            ..physical_default
+        };
+
+        assert_ne!(
+            route_rows_fingerprint(&[physical_default]),
+            route_rows_fingerprint(&[physical_default, forti_default]),
+            "connecting an unmanaged Full Tunnel VPN must invalidate the endpoint snapshot"
+        );
+        assert_eq!(
+            route_rows_fingerprint(&[physical_default, forti_default]),
+            route_rows_fingerprint(&[forti_default, physical_default]),
+            "Windows may return the same route rows in a different order"
         );
     }
 
