@@ -9,7 +9,7 @@ use std::{
 
 use super::{
     APPLY_DNS_POLICY_SCRIPT, APPLY_ROUTES_SCRIPT, DISCOVER_ADAPTERS_SCRIPT,
-    DISCOVER_INTERNET_GATEWAY_SCRIPT, RESOLVE_DNS_SCRIPT,
+    DISCOVER_INTERNET_GATEWAY_SCRIPT, DISCOVER_NATIVE_ROUTES_SCRIPT, RESOLVE_DNS_SCRIPT,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -18,6 +18,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub(super) enum Query {
     DiscoverVpnAdapters,
     DiscoverInternetGateway,
+    DiscoverNativeRoutes,
     ResolveIpv4,
 }
 
@@ -26,6 +27,7 @@ impl Query {
         match self {
             Self::DiscoverVpnAdapters => DISCOVER_ADAPTERS_SCRIPT,
             Self::DiscoverInternetGateway => DISCOVER_INTERNET_GATEWAY_SCRIPT,
+            Self::DiscoverNativeRoutes => DISCOVER_NATIVE_ROUTES_SCRIPT,
             Self::ResolveIpv4 => RESOLVE_DNS_SCRIPT,
         }
     }

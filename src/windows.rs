@@ -6,6 +6,7 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
+use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, SetLastError},
@@ -222,29 +223,17 @@ $adapters = @(
             }
 
             $coverageSets = @(
-                [pscustomobject]@{
-                    prefixLength = [byte]4
-                    prefixes = @(
-                        '0.0.0.0/4', '16.0.0.0/4', '32.0.0.0/4', '48.0.0.0/4',
-                        '64.0.0.0/4', '80.0.0.0/4', '96.0.0.0/4', '112.0.0.0/4',
-                        '128.0.0.0/4', '144.0.0.0/4', '160.0.0.0/4', '176.0.0.0/4',
-                        '192.0.0.0/4', '208.0.0.0/4', '224.0.0.0/4', '240.0.0.0/4'
-                    )
-                }
-                [pscustomobject]@{
-                    prefixLength = [byte]3
-                    prefixes = @(
-                        '0.0.0.0/3', '32.0.0.0/3', '64.0.0.0/3', '96.0.0.0/3',
-                        '128.0.0.0/3', '160.0.0.0/3', '192.0.0.0/3', '224.0.0.0/3'
-                    )
-                }
-                [pscustomobject]@{
-                    prefixLength = [byte]2
-                    prefixes = @('0.0.0.0/2', '64.0.0.0/2', '128.0.0.0/2', '192.0.0.0/2')
-                }
-                [pscustomobject]@{
-                    prefixLength = [byte]1
-                    prefixes = @('0.0.0.0/1', '128.0.0.0/1')
+                foreach ($prefixLength in 4, 3, 2, 1) {
+                    $count = 1 -shl $prefixLength
+                    $firstOctetStep = 256 / $count
+                    [pscustomobject]@{
+                        prefixLength = [byte]$prefixLength
+                        prefixes = @(
+                            0..($count - 1) | ForEach-Object {
+                                "$($_ * $firstOctetStep).0.0.0/$prefixLength"
+                            }
+                        )
+                    }
                 }
             )
             $defaultRoutes = @(
@@ -496,6 +485,52 @@ if ($null -eq $selectedRoute) {
         fallback_dns_servers = @($fallbackDnsServers)
     } | ConvertTo-Json -Compress
 }
+"#;
+
+const DISCOVER_NATIVE_ROUTES_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+
+$interfaces = @{}
+Get-NetIPInterface `
+    -AddressFamily IPv4 `
+    -IncludeAllCompartments `
+    -ErrorAction SilentlyContinue |
+    Where-Object { [string]$_.ConnectionState -eq 'Connected' } |
+    Sort-Object InterfaceMetric |
+    ForEach-Object {
+        $index = [uint32]$_.InterfaceIndex
+        if (-not $interfaces.ContainsKey($index)) {
+            $interfaces[$index] = [uint32]$_.InterfaceMetric
+        }
+    }
+
+$routes = @(
+    Get-NetRoute `
+        -AddressFamily IPv4 `
+        -PolicyStore ActiveStore `
+        -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $route = $_
+            $prefixText = [string]$route.DestinationPrefix
+            if ($prefixText -match '/([0-9]+)$') {
+                $prefixLength = [byte]$Matches[1]
+                $interfaceIndex = [uint32]$route.InterfaceIndex
+                if ($prefixLength -le 4 -and $interfaces.ContainsKey($interfaceIndex)) {
+                    [pscustomobject]@{
+                        prefix = $prefixText
+                        interface_index = $interfaceIndex
+                        next_hop = [string]$route.NextHop
+                        route_metric = [uint32]$route.RouteMetric
+                        interface_metric = [uint32]$interfaces[$interfaceIndex]
+                    }
+                }
+            }
+        }
+)
+
+ConvertTo-Json -InputObject @($routes) -Compress
 "#;
 
 const APPLY_ROUTES_SCRIPT: &str = r#"
@@ -869,6 +904,21 @@ pub struct NetworkAdapter {
     pub dns_servers: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRoute {
+    pub prefix: Ipv4Net,
+    pub interface_index: u32,
+    pub next_hop: String,
+    pub route_metric: u32,
+    pub interface_metric: u32,
+}
+
+impl NativeRoute {
+    pub fn effective_metric(&self) -> u64 {
+        u64::from(self.route_metric) + u64::from(self.interface_metric)
+    }
+}
+
 impl NetworkAdapter {
     pub fn matches(&self, vpn: VpnKind) -> bool {
         let label = format!("{} {}", self.name, self.description).to_ascii_lowercase();
@@ -1008,6 +1058,22 @@ pub(crate) fn discover_internet_gateway(
 
     serde_json::from_str(output.stdout.trim())
         .map_err(|error| format!("無法解析一般網路閘道資料：{error}"))
+}
+
+pub(crate) fn discover_native_routes(
+    cancellation: &AtomicBool,
+) -> Result<Vec<NativeRoute>, String> {
+    let output = powershell::run_query(
+        PowerShellQuery::DiscoverNativeRoutes,
+        "",
+        Some(cancellation),
+    )?;
+    if !output.success {
+        return Err(powershell_failure(&output));
+    }
+
+    serde_json::from_str(output.stdout.trim())
+        .map_err(|error| format!("無法解析 Windows 原生路由資料：{error}"))
 }
 
 fn with_ipv4_route_rows<T>(inspect: impl FnOnce(&[MIB_IPFORWARD_ROW2]) -> T) -> Result<T, String> {
@@ -1841,6 +1907,45 @@ function Get-NetRoute {
             "a five-second health check must not launch Windows PowerShell; elapsed={:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn discovers_only_connected_native_routes_wide_enough_to_affect_bypass_planning() {
+        let fixture = r#"
+function Get-NetIPInterface {
+    @(
+        [pscustomobject]@{ InterfaceIndex = [uint32]7; InterfaceMetric = [uint32]25; ConnectionState = 'Connected' }
+        [pscustomobject]@{ InterfaceIndex = [uint32]44; InterfaceMetric = [uint32]1; ConnectionState = 'Connected' }
+        [pscustomobject]@{ InterfaceIndex = [uint32]99; InterfaceMetric = [uint32]1; ConnectionState = 'Disconnected' }
+    )
+}
+function Get-NetRoute {
+    @(
+        [pscustomobject]@{ DestinationPrefix = '0.0.0.0/0'; InterfaceIndex = [uint32]7; NextHop = '192.0.2.1'; RouteMetric = [uint32]25 }
+        [pscustomobject]@{ DestinationPrefix = '0.0.0.0/3'; InterfaceIndex = [uint32]44; NextHop = '0.0.0.0'; RouteMetric = [uint32]1 }
+        [pscustomobject]@{ DestinationPrefix = '10.0.0.0/8'; InterfaceIndex = [uint32]44; NextHop = '0.0.0.0'; RouteMetric = [uint32]1 }
+        [pscustomobject]@{ DestinationPrefix = '128.0.0.0/1'; InterfaceIndex = [uint32]99; NextHop = '0.0.0.0'; RouteMetric = [uint32]1 }
+    )
+}
+"#;
+        let script = format!("{fixture}\n{DISCOVER_NATIVE_ROUTES_SCRIPT}");
+        let output = powershell::run_test_script(&script, "", None)
+            .expect("native route discovery fixture should run");
+        assert!(output.success, "{}", powershell_failure(&output));
+        let routes: Vec<NativeRoute> =
+            serde_json::from_str(output.stdout.trim()).expect("fixture output should be JSON");
+
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().any(|route| {
+            route.prefix == "0.0.0.0/0".parse().unwrap()
+                && route.interface_index == 7
+                && route.effective_metric() == 50
+        }));
+        assert!(routes.iter().any(|route| {
+            route.prefix == "0.0.0.0/3".parse().unwrap()
+                && route.interface_index == 44
+                && route.effective_metric() == 2
+        }));
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    net::Ipv4Addr,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -12,52 +11,39 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::{collections::BTreeSet, net::Ipv4Addr};
+
 use eframe::egui::{
     self, Color32, ComboBox, FontData, FontDefinitions, FontFamily, RichText, Stroke,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::{
-        SplitterConfig, ValidatedProfile, VpnKind, configured_dns_hostnames,
-        configured_static_networks, has_enabled_dns_targets, validate_config_with_resolver,
-    },
+    domain::{SplitterConfig, VpnKind},
+    policy::*,
     windows::{
-        InternetGateway, ManagedDnsRule, ManagedRoute, ManagedRoutePurpose, NetworkAdapter,
-        RoutePriority, RouteTableFingerprint, apply_dns_policy,
-        apply_dns_policy_unless_cancelled_before_start, apply_routes, discover_internet_gateway,
-        discover_vpn_adapters, existing_managed_routes, inspect_ipv4_route_table,
-        resolve_ipv4_with_dns_servers,
+        InternetGateway, ManagedRoute, ManagedRoutePurpose, NativeRoute, NetworkAdapter,
+        RouteTableFingerprint, apply_dns_policy, apply_dns_policy_unless_cancelled_before_start,
+        apply_routes, discover_internet_gateway, discover_native_routes, discover_vpn_adapters,
+        existing_managed_routes, inspect_ipv4_route_table, resolve_ipv4_with_dns_servers,
     },
 };
 
+#[cfg(test)]
+use crate::{
+    domain::has_enabled_dns_targets,
+    windows::{ManagedDnsRule, RoutePriority},
+};
+
 const APP_ID: &str = "tw.layton.rust-vpn-splitter";
-const ROUTE_METRIC: u16 = 5;
 const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const ROUTE_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 const ENDPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const SHUTDOWN_CLEANUP_ATTEMPTS: usize = 3;
-// Use /4 coverage when Windows' native priorities cannot preserve the selected
-// fallback. It remains more specific than the /2 or /3 Full Tunnel sets used by
-// some FortiClient versions; native /4 fallback sets are reused instead.
-const INTERNET_BYPASS_PREFIXES: [&str; 16] = [
-    "0.0.0.0/4",
-    "16.0.0.0/4",
-    "32.0.0.0/4",
-    "48.0.0.0/4",
-    "64.0.0.0/4",
-    "80.0.0.0/4",
-    "96.0.0.0/4",
-    "112.0.0.0/4",
-    "128.0.0.0/4",
-    "144.0.0.0/4",
-    "160.0.0.0/4",
-    "176.0.0.0/4",
-    "192.0.0.0/4",
-    "208.0.0.0/4",
-    "224.0.0.0/4",
-    "240.0.0.0/4",
-];
+// /4 remains more specific than the /2 or /3 Full Tunnel sets used by some
+// VPN clients. The prefixes are generated so discovery and planning cannot
+// drift through separately maintained literal lists.
 const MIN_PROFILE_CARD_WIDTH: f32 = 340.0;
 const MIN_PROFILE_CARD_CONTENT_HEIGHT: f32 = 300.0;
 const MIN_PROFILE_CARD_HEIGHT: f32 = MIN_PROFILE_CARD_CONTENT_HEIGHT + 35.0;
@@ -75,28 +61,6 @@ enum Banner {
     Info(String),
     Success(String),
     Error(String),
-}
-
-#[derive(Debug, Default)]
-struct PreparedRoutes {
-    routes: Vec<ManagedRoute>,
-    dns_rules: Vec<ManagedDnsRule>,
-    warnings: Vec<String>,
-}
-
-#[derive(Debug)]
-struct AppliedPolicy {
-    prepared: PreparedRoutes,
-    changed: bool,
-}
-
-#[derive(Debug)]
-struct RouteHealthPlan {
-    config: SplitterConfig,
-    routes: Vec<ManagedRoute>,
-    dns_rules: Vec<ManagedDnsRule>,
-    disabled_vpns: Vec<VpnKind>,
-    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,68 +103,6 @@ enum QueuedForegroundAction {
 }
 
 #[derive(Debug, Clone)]
-struct ReconciledRoutes {
-    routes: Vec<ManagedRoute>,
-    removed: usize,
-}
-
-struct NetworkSnapshot {
-    adapters: Vec<NetworkAdapter>,
-    internet_gateway: Option<InternetGateway>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum InternetFallback<'a> {
-    Physical(&'a InternetGateway),
-    Vpn {
-        vpn: VpnKind,
-        adapter: &'a NetworkAdapter,
-    },
-}
-
-impl<'a> InternetFallback<'a> {
-    fn interface_index(self) -> u32 {
-        match self {
-            Self::Physical(gateway) => gateway.interface_index,
-            Self::Vpn { adapter, .. } => adapter.index,
-        }
-    }
-
-    fn next_hop(self) -> &'a str {
-        match self {
-            Self::Physical(gateway) => &gateway.next_hop,
-            Self::Vpn { adapter, .. } => &adapter.next_hop,
-        }
-    }
-
-    fn priority(self) -> Option<RoutePriority> {
-        match self {
-            Self::Physical(gateway) => gateway.route_priority,
-            Self::Vpn { adapter, .. } => adapter.full_tunnel_priority,
-        }
-    }
-
-    fn label(self) -> String {
-        match self {
-            Self::Physical(gateway) => gateway.interface_alias.clone(),
-            Self::Vpn { vpn, adapter } => format!("未啟用分流的 {vpn}（{}）", adapter.name),
-        }
-    }
-
-    fn inferred_from_escape_route(self) -> bool {
-        matches!(self, Self::Physical(gateway) if gateway.inferred_from_escape_route)
-    }
-}
-
-struct PolicyTransactionInput<'a> {
-    managed_routes: &'a [ManagedRoute],
-    active_routes: &'a [ManagedRoute],
-    config: &'a SplitterConfig,
-    adapters: &'a [NetworkAdapter],
-    internet_gateway: Option<&'a InternetGateway>,
-}
-
-#[derive(Debug, Clone)]
 struct RefreshOutcome {
     route_notice: Result<ReconciledRoutes, String>,
     dns_notice: Result<bool, String>,
@@ -228,21 +130,6 @@ enum DnsRefreshOutcome {
     Unchanged,
     Updated {
         routes: Vec<ManagedRoute>,
-        warnings: Vec<String>,
-    },
-    Failed(String),
-}
-
-#[derive(Debug, Clone)]
-enum RouteHealthOutcome {
-    Healthy,
-    Updated {
-        config: SplitterConfig,
-        routes: Vec<ManagedRoute>,
-        adapters: Vec<NetworkAdapter>,
-        internet_gateway: Option<Box<InternetGateway>>,
-        repaired: bool,
-        disabled_vpns: Vec<VpnKind>,
         warnings: Vec<String>,
     },
     Failed(String),
@@ -302,94 +189,20 @@ impl PendingOperation {
     }
 }
 
-#[cfg(test)]
-fn replace_vpn_routes(
-    current: &[ManagedRoute],
-    vpn: VpnKind,
-    replacement: Vec<ManagedRoute>,
-) -> Vec<ManagedRoute> {
-    current
-        .iter()
-        .filter(|route| route.vpn != vpn)
-        .cloned()
-        .chain(replacement)
-        .collect()
-}
-
-fn routes_match(left: &[ManagedRoute], right: &[ManagedRoute]) -> bool {
-    left.len() == right.len() && left.iter().all(|route| right.contains(route))
-}
-
-fn needs_periodic_route_refresh(config: &SplitterConfig) -> bool {
-    config.profiles.iter().any(|profile| profile.enabled)
-}
-
-fn should_schedule_dns_refresh(config: &SplitterConfig) -> bool {
-    has_enabled_dns_targets(config)
-}
-
-fn discard_incomplete_vpn_route_sets(
-    previous: &[ManagedRoute],
-    existing: &[ManagedRoute],
-) -> Vec<ManagedRoute> {
-    existing
-        .iter()
-        .filter(|route| {
-            let previous_count = previous
-                .iter()
-                .filter(|candidate| candidate.vpn == route.vpn)
-                .count();
-            let existing_count = existing
-                .iter()
-                .filter(|candidate| candidate.vpn == route.vpn)
-                .count();
-            previous_count == existing_count
-        })
-        .cloned()
-        .collect()
-}
-
-fn reconciled_routes_for_config(
-    previous: &[ManagedRoute],
-    existing: &[ManagedRoute],
-    config: &SplitterConfig,
-) -> Vec<ManagedRoute> {
-    discard_incomplete_vpn_route_sets(previous, existing)
-        .into_iter()
-        .filter(|route| {
-            config
-                .profile(route.vpn)
-                .is_some_and(|profile| profile.enabled)
-        })
-        .collect()
-}
-
-fn reconcile_routes(
-    previous: Vec<ManagedRoute>,
-    config: SplitterConfig,
-) -> Result<ReconciledRoutes, String> {
-    let previous_count = previous.len();
-    let existing = existing_managed_routes(&previous)?;
-    let reconciled = reconciled_routes_for_config(&previous, &existing, &config);
-
-    if !routes_match(&existing, &reconciled) {
-        apply_routes(&existing, &reconciled)?;
-    }
-
-    Ok(ReconciledRoutes {
-        removed: previous_count.saturating_sub(reconciled.len()),
-        routes: reconciled,
-    })
-}
-
 fn run_refresh(
-    previous: Vec<ManagedRoute>,
+    mut previous: Vec<ManagedRoute>,
     config: SplitterConfig,
+    state_path: PathBuf,
     cancellation: Arc<AtomicBool>,
 ) -> OperationResult {
+    let journal_path = route_journal_path(&state_path);
+    let recovery_error = merge_route_journal(&mut previous, &journal_path).err();
     let remove_stale_dns_rules = !config.profiles.iter().any(|profile| profile.enabled);
     let (route_notice, gateway_notice, adapter_notice) = thread::scope(|scope| {
-        let route_task = scope.spawn(move || reconcile_routes(previous, config));
+        let route_task = scope.spawn(move || match recovery_error {
+            Some(error) => Err(error),
+            None => reconcile_routes(previous, config),
+        });
         let gateway_cancellation = Arc::clone(&cancellation);
         let gateway_task = scope.spawn(move || discover_internet_gateway(&gateway_cancellation));
         let adapter_cancellation = Arc::clone(&cancellation);
@@ -433,401 +246,28 @@ fn cleanup_stale_dns_rules_if_needed(
 }
 
 fn discover_network_snapshot(cancellation: &AtomicBool) -> Result<NetworkSnapshot, String> {
-    let (adapters, internet_gateway) = thread::scope(|scope| {
+    let (adapters, internet_gateway, native_routes) = thread::scope(|scope| {
         let adapter_task = scope.spawn(|| discover_vpn_adapters(cancellation));
         let gateway_task = scope.spawn(|| discover_internet_gateway(cancellation));
+        let native_route_task = scope.spawn(|| discover_native_routes(cancellation));
         let adapters = adapter_task
             .join()
             .unwrap_or_else(|_| Err("背景偵測 VPN 介面時異常終止。".to_owned()));
         let internet_gateway = gateway_task
             .join()
             .unwrap_or_else(|_| Err("背景偵測一般網路閘道時異常終止。".to_owned()));
-        (adapters, internet_gateway)
+        let native_routes = native_route_task
+            .join()
+            .unwrap_or_else(|_| Err("背景偵測 Windows 原生路由時異常終止。".to_owned()));
+        (adapters, internet_gateway, native_routes)
     });
 
     Ok(NetworkSnapshot {
         adapters: adapters.map_err(|error| format!("無法重新偵測 VPN 介面：{error}"))?,
         internet_gateway: internet_gateway
             .map_err(|error| format!("無法重新偵測一般網路閘道：{error}"))?,
-    })
-}
-
-#[cfg(test)]
-fn prepare_profile_routes_for(
-    config: &SplitterConfig,
-    vpn: VpnKind,
-    adapters: &[NetworkAdapter],
-    internet_gateway: Option<&InternetGateway>,
-) -> Result<PreparedRoutes, Vec<String>> {
-    let mut prepared = prepare_all_enabled_routes_for(config, adapters, internet_gateway)?;
-    prepared.routes.retain(|route| route.vpn == vpn);
-    Ok(prepared)
-}
-
-#[cfg(test)]
-fn prepare_all_enabled_routes_for(
-    config: &SplitterConfig,
-    adapters: &[NetworkAdapter],
-    internet_gateway: Option<&InternetGateway>,
-) -> Result<PreparedRoutes, Vec<String>> {
-    prepare_all_enabled_routes_with_resolver(
-        config,
-        adapters,
-        internet_gateway,
-        |_, hostname, servers| resolve_ipv4_with_dns_servers(hostname, servers),
-    )
-}
-
-fn prepare_all_enabled_routes_with_resolver(
-    config: &SplitterConfig,
-    adapters: &[NetworkAdapter],
-    internet_gateway: Option<&InternetGateway>,
-    mut resolve_hostname: impl FnMut(VpnKind, &str, &[String]) -> Result<Vec<Ipv4Addr>, String>,
-) -> Result<PreparedRoutes, Vec<String>> {
-    if !config.profiles.iter().any(|profile| profile.enabled) {
-        return Ok(PreparedRoutes::default());
-    }
-
-    for profile in config.profiles.iter().filter(|profile| profile.enabled) {
-        selected_adapter_for_profile(config, profile.vpn, adapters)?;
-    }
-
-    let full_tunnel_vpns = enabled_full_tunnel_vpns(config, adapters);
-    let fallback = select_internet_fallback(config, adapters, internet_gateway);
-    let manage_dns = should_manage_dns_policy(config, &full_tunnel_vpns, fallback);
-    let fallback_dns = manage_dns
-        .then(|| fallback_dns_servers(config, fallback, adapters))
-        .transpose()?;
-    let validated = validate_config_with_resolver(config, |vpn, hostname| {
-        let vpn_dns = profile_dns_servers(
-            config,
-            vpn,
-            adapters,
-            fallback_dns.as_deref().unwrap_or_default(),
-        )
-        .map_err(|errors| errors.join("\n"))?;
-        resolve_hostname(vpn, hostname, &vpn_dns)
-    })
-    .map_err(|errors| {
-        errors
-            .into_iter()
-            .map(|error| error.message)
-            .collect::<Vec<_>>()
-    })?;
-    let mut prepared = PreparedRoutes::default();
-
-    for profile in &validated {
-        prepared
-            .routes
-            .extend(prepare_validated_profile_routes(config, profile, adapters)?);
-    }
-
-    append_internet_bypass_routes(&mut prepared, config, adapters, &full_tunnel_vpns, fallback)?;
-    if let Some(fallback_dns) = fallback_dns.as_deref() {
-        append_dns_policy(
-            &mut prepared,
-            &validated,
-            config,
-            adapters,
-            fallback.expect("managed DNS requires a fallback path"),
-            fallback_dns,
-        )?;
-    }
-
-    Ok(prepared)
-}
-
-fn selected_adapter_for_profile<'a>(
-    config: &SplitterConfig,
-    vpn: VpnKind,
-    adapters: &'a [NetworkAdapter],
-) -> Result<&'a NetworkAdapter, Vec<String>> {
-    let profile = config
-        .profile(vpn)
-        .expect("selected VPN profiles originate from config");
-    let Some(description) = profile.adapter_description.as_ref() else {
-        return Err(vec![format!(
-            "{} 已啟用，但尚未選擇 VPN 網路介面。",
-            profile.vpn
-        )]);
-    };
-    let Some(adapter) = adapters
-        .iter()
-        .find(|adapter| adapter.matches(profile.vpn) && &adapter.description == description)
-    else {
-        return Err(vec![format!(
-            "{} 找不到已選擇的介面「{}」，請重新偵測。",
-            profile.vpn, description
-        )]);
-    };
-
-    if !adapter.is_up() {
-        return Err(vec![format!(
-            "{} 的介面「{}」尚未連線。",
-            profile.vpn, adapter.description
-        )]);
-    }
-
-    Ok(adapter)
-}
-
-fn normalized_ipv4_servers(servers: &[String]) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    servers
-        .iter()
-        .filter_map(|server| server.parse::<Ipv4Addr>().ok())
-        .map(|server| server.to_string())
-        .filter(|server| seen.insert(server.clone()))
-        .collect()
-}
-
-fn configured_vpn_dns_routes(
-    config: &SplitterConfig,
-    adapters: &[NetworkAdapter],
-    fallback_dns: &[String],
-) -> Result<Vec<ManagedRoute>, Vec<String>> {
-    let mut routes: Vec<ManagedRoute> = Vec::new();
-
-    for profile in config.profiles.iter().filter(|profile| profile.enabled) {
-        let hostnames = configured_dns_hostnames(profile)
-            .map_err(|error| vec![format!("{} 的 DNS 目標無效：{error}", profile.vpn)])?;
-        if hostnames.is_empty() {
-            continue;
-        }
-
-        let adapter = selected_adapter_for_profile(config, profile.vpn, adapters)?;
-        let vpn_dns = profile_dns_servers(config, profile.vpn, adapters, fallback_dns)?;
-        for server in vpn_dns {
-            let prefix = format!("{server}/32");
-            if let Some(existing) = routes.iter().find(|route| route.prefix == prefix) {
-                return Err(vec![format!(
-                    "{} 與 {} 使用同一個 VPN DNS server {server}，但 Windows 只能選擇一條介面路由。",
-                    existing.vpn, profile.vpn
-                )]);
-            }
-            routes.push(ManagedRoute {
-                vpn: profile.vpn,
-                purpose: ManagedRoutePurpose::VpnDnsServer,
-                prefix,
-                interface_index: adapter.index,
-                next_hop: adapter.next_hop.clone(),
-                route_metric: ROUTE_METRIC,
-            });
-        }
-    }
-
-    Ok(routes)
-}
-
-fn validate_dns_hostname_ownership(config: &SplitterConfig) -> Result<(), Vec<String>> {
-    let mut owners = BTreeMap::new();
-    for profile in config.profiles.iter().filter(|profile| profile.enabled) {
-        let hostnames = configured_dns_hostnames(profile)
-            .map_err(|error| vec![format!("{} 的 DNS 目標無效：{error}", profile.vpn)])?;
-        for hostname in hostnames {
-            if let Some(existing_vpn) = owners.insert(hostname.clone(), profile.vpn)
-                && existing_vpn != profile.vpn
-            {
-                return Err(vec![format!(
-                    "網域 {hostname} 同時指定給 {existing_vpn} 與 {}；同一名稱只能使用一組 VPN DNS。",
-                    profile.vpn
-                )]);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_vpn_dns_server_ownership(
-    config: &SplitterConfig,
-    adapters: &[NetworkAdapter],
-    fallback_dns: &[String],
-) -> Result<(), Vec<String>> {
-    let mut owners = BTreeMap::new();
-    for profile in config.profiles.iter().filter(|profile| profile.enabled) {
-        let hostnames = configured_dns_hostnames(profile)
-            .map_err(|error| vec![format!("{} 的 DNS 目標無效：{error}", profile.vpn)])?;
-        if hostnames.is_empty() {
-            continue;
-        }
-        for server in profile_dns_servers(config, profile.vpn, adapters, fallback_dns)? {
-            if let Some(existing_vpn) = owners.insert(server.clone(), profile.vpn)
-                && existing_vpn != profile.vpn
-            {
-                return Err(vec![format!(
-                    "{existing_vpn} 與 {} 的網路介面都宣告 DNS server {server}；Windows 無法把同一目的 IP 同時固定到兩條 VPN，已停止套用以避免 DNS 串線。",
-                    profile.vpn
-                )]);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_dns_route_target_conflicts(
-    config: &SplitterConfig,
-    dns_routes: &[ManagedRoute],
-) -> Result<(), Vec<String>> {
-    for profile in config.profiles.iter().filter(|profile| profile.enabled) {
-        let networks = configured_static_networks(profile)
-            .map_err(|error| vec![format!("{} 的目標無效：{error}", profile.vpn)])?;
-        for dns_route in dns_routes
-            .iter()
-            .filter(|dns_route| dns_route.vpn != profile.vpn)
-        {
-            let address = dns_route
-                .prefix
-                .strip_suffix("/32")
-                .expect("DNS bootstrap routes are IPv4 host routes")
-                .parse::<Ipv4Addr>()
-                .expect("DNS bootstrap routes contain normalized IPv4 addresses");
-            if let Some(network) = networks.iter().find(|network| network.contains(&address)) {
-                return Err(vec![format!(
-                    "{} 的 DNS server {address} 被 {} 的目標「{network}」涵蓋，無法同時建立正確 DNS 路由。",
-                    dns_route.vpn, profile.vpn
-                )]);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn routes_with_dns_bootstrap(
-    current_routes: &[ManagedRoute],
-    dns_routes: Vec<ManagedRoute>,
-) -> Vec<ManagedRoute> {
-    let mut staged = current_routes.to_vec();
-    for dns_route in dns_routes {
-        if staged.contains(&dns_route) {
-            continue;
-        }
-        staged.retain(|route| route.prefix != dns_route.prefix);
-        staged.push(dns_route);
-    }
-    staged
-}
-
-fn routes_for_policy_transition(
-    staged_routes: &[ManagedRoute],
-    final_routes: &[ManagedRoute],
-) -> Vec<ManagedRoute> {
-    let mut transition = final_routes.to_vec();
-    for route in staged_routes
-        .iter()
-        .filter(|route| route.purpose == ManagedRoutePurpose::VpnDnsServer)
-    {
-        if transition
-            .iter()
-            .any(|candidate| candidate.prefix == route.prefix)
-        {
-            continue;
-        }
-        transition.push(route.clone());
-    }
-    transition
-}
-
-fn rollback_policy_routes(
-    active_routes: &[ManagedRoute],
-    original_routes: &[ManagedRoute],
-    replace_routes: &mut impl FnMut(&[ManagedRoute], &[ManagedRoute]) -> Result<(), String>,
-    error: String,
-) -> String {
-    if routes_match(active_routes, original_routes) {
-        return error;
-    }
-    match replace_routes(active_routes, original_routes) {
-        Ok(()) => format!("{error}\n已將 IPv4 路由回復到套用前狀態。"),
-        Err(rollback_error) => {
-            format!("{error}\nIPv4 路由回復也失敗：{rollback_error}")
-        }
-    }
-}
-
-fn apply_policy_transaction_with(
-    input: PolicyTransactionInput<'_>,
-    mut resolve_hostname: impl FnMut(VpnKind, &str, &[String]) -> Result<Vec<Ipv4Addr>, String>,
-    mut replace_routes: impl FnMut(&[ManagedRoute], &[ManagedRoute]) -> Result<(), String>,
-    mut replace_dns_policy: impl FnMut(&[ManagedDnsRule]) -> Result<bool, String>,
-) -> Result<AppliedPolicy, String> {
-    let PolicyTransactionInput {
-        managed_routes,
-        active_routes,
-        config,
-        adapters,
-        internet_gateway,
-    } = input;
-    let full_tunnel_vpns = enabled_full_tunnel_vpns(config, adapters);
-    let fallback = select_internet_fallback(config, adapters, internet_gateway);
-    let fallback_dns = should_manage_dns_policy(config, &full_tunnel_vpns, fallback)
-        .then(|| fallback_dns_servers(config, fallback, adapters))
-        .transpose()
-        .map_err(|errors| errors.join("\n"))?
-        .unwrap_or_default();
-    validate_dns_hostname_ownership(config).map_err(|errors| errors.join("\n"))?;
-    validate_vpn_dns_server_ownership(config, adapters, &fallback_dns)
-        .map_err(|errors| errors.join("\n"))?;
-    let bootstrap_routes = configured_vpn_dns_routes(config, adapters, &fallback_dns)
-        .map_err(|errors| errors.join("\n"))?;
-    validate_dns_route_target_conflicts(config, &bootstrap_routes)
-        .map_err(|errors| errors.join("\n"))?;
-    let staged_routes = routes_with_dns_bootstrap(managed_routes, bootstrap_routes);
-    let bootstrap_changed = !routes_match(active_routes, &staged_routes);
-    if bootstrap_changed {
-        replace_routes(active_routes, &staged_routes)?;
-    }
-
-    let mut prepared = match prepare_all_enabled_routes_with_resolver(
-        config,
-        adapters,
-        internet_gateway,
-        &mut resolve_hostname,
-    ) {
-        Ok(prepared) => prepared,
-        Err(errors) => {
-            return Err(rollback_policy_routes(
-                &staged_routes,
-                active_routes,
-                &mut replace_routes,
-                errors.join("\n"),
-            ));
-        }
-    };
-
-    let transition_routes = routes_for_policy_transition(&staged_routes, &prepared.routes);
-    let transition_changed = !routes_match(&staged_routes, &transition_routes);
-    if transition_changed && let Err(error) = replace_routes(&staged_routes, &transition_routes) {
-        return Err(rollback_policy_routes(
-            &staged_routes,
-            active_routes,
-            &mut replace_routes,
-            error,
-        ));
-    }
-
-    let dns_changed = match replace_dns_policy(&prepared.dns_rules) {
-        Ok(changed) => changed,
-        Err(error) => {
-            return Err(rollback_policy_routes(
-                &transition_routes,
-                active_routes,
-                &mut replace_routes,
-                error,
-            ));
-        }
-    };
-
-    let cleanup_changed = !routes_match(&transition_routes, &prepared.routes);
-    if cleanup_changed && let Err(error) = replace_routes(&transition_routes, &prepared.routes) {
-        prepared.warnings.push(format!(
-            "DNS 分流已更新，但舊路由暫時無法清除；健康檢查將自動重試：{error}"
-        ));
-        prepared.routes = transition_routes;
-    }
-
-    Ok(AppliedPolicy {
-        prepared,
-        changed: bootstrap_changed || transition_changed || cleanup_changed || dns_changed,
+        native_routes: native_routes
+            .map_err(|error| format!("無法重新偵測 Windows 原生路由：{error}"))?,
     })
 }
 
@@ -836,10 +276,12 @@ fn apply_policy_transaction(
     config: &SplitterConfig,
     adapters: &[NetworkAdapter],
     internet_gateway: Option<&InternetGateway>,
+    native_routes: &[NativeRoute],
+    journal_path: &Path,
 ) -> Result<AppliedPolicy, String> {
     let active_routes = existing_managed_routes(current_routes)
         .map_err(|error| format!("無法核對套用前的 ActiveStore 分流路由：{error}"))?;
-    apply_policy_transaction_with(
+    apply_policy_transaction_with_native_routes(
         PolicyTransactionInput {
             managed_routes: current_routes,
             active_routes: &active_routes,
@@ -847,413 +289,19 @@ fn apply_policy_transaction(
             adapters,
             internet_gateway,
         },
+        native_routes,
         |_, hostname, servers| resolve_ipv4_with_dns_servers(hostname, servers),
-        |previous, desired| apply_routes(previous, desired).map(|_| ()),
+        |previous, desired| journaled_route_change(journal_path, previous, desired),
         |rules| apply_dns_policy(rules).map(|result| result.changed),
     )
 }
 
-fn adapter_vpn_kind(adapter: &NetworkAdapter) -> Option<VpnKind> {
-    VpnKind::ALL.into_iter().find(|vpn| adapter.matches(*vpn))
-}
-
-fn fallback_is_preferred(candidate: InternetFallback<'_>, current: InternetFallback<'_>) -> bool {
-    match (candidate.priority(), current.priority()) {
-        (Some(candidate_priority), Some(current_priority)) => {
-            candidate_priority.prefix_length > current_priority.prefix_length
-                || (candidate_priority.prefix_length == current_priority.prefix_length
-                    && (candidate_priority.effective_metric < current_priority.effective_metric
-                        || (candidate_priority.effective_metric
-                            == current_priority.effective_metric
-                            && candidate.interface_index() < current.interface_index())))
-        }
-        (Some(_), None) => true,
-        (None, Some(_)) | (None, None) => false,
-    }
-}
-
-fn select_internet_fallback<'a>(
-    config: &SplitterConfig,
-    adapters: &'a [NetworkAdapter],
-    internet_gateway: Option<&'a InternetGateway>,
-) -> Option<InternetFallback<'a>> {
-    let mut selected = internet_gateway.map(InternetFallback::Physical);
-
-    for adapter in adapters
-        .iter()
-        .filter(|adapter| adapter.is_up() && adapter.full_tunnel_priority.is_some())
-    {
-        let Some(vpn) = adapter_vpn_kind(adapter) else {
-            continue;
-        };
-        if config.profile(vpn).is_some_and(|profile| profile.enabled) {
-            continue;
-        }
-
-        let candidate = InternetFallback::Vpn { vpn, adapter };
-        if selected.is_none_or(|current| fallback_is_preferred(candidate, current)) {
-            selected = Some(candidate);
-        }
-    }
-
-    selected
-}
-
-fn fallback_dns_servers(
-    config: &SplitterConfig,
-    fallback: Option<InternetFallback<'_>>,
-    adapters: &[NetworkAdapter],
-) -> Result<Vec<String>, Vec<String>> {
-    let mut servers = match fallback {
-        Some(InternetFallback::Physical(gateway)) => {
-            current_network_dns_servers(adapters, Some(gateway))?
-        }
-        Some(InternetFallback::Vpn { vpn, adapter }) => {
-            let servers = normalized_ipv4_servers(&adapter.dns_servers);
-            if servers.is_empty() {
-                return Err(vec![format!(
-                    "{vpn} 已連線且其原生通道應處理未指定流量，但介面「{}」沒有可辨識的 IPv4 DNS server；為避免改變未啟用分流時的 DNS 行為，已停止套用。",
-                    adapter.description
-                )]);
-            }
-            servers
-        }
-        None => {
-            return Err(vec![
-                "找不到可接手未指定流量的原生 VPN 或一般網路，已停止套用。".to_owned(),
-            ]);
-        }
-    };
-
-    for profile in config.profiles.iter().filter(|profile| profile.enabled) {
-        let Some(description) = profile.adapter_description.as_ref() else {
-            continue;
-        };
-        let Some(adapter) = adapters.iter().find(|adapter| {
-            adapter.matches(profile.vpn) && &adapter.description == description && adapter.is_up()
-        }) else {
-            continue;
-        };
-        let profile_servers = normalized_ipv4_servers(&adapter.dns_servers);
-        let fallback_is_subset = servers
-            .iter()
-            .all(|server| profile_servers.contains(server));
-        if !fallback_is_subset {
-            servers.retain(|server| !profile_servers.contains(server));
-        }
-    }
-
-    if servers.is_empty() {
-        Err(vec![
-            "接手未指定流量的網路介面只回報了啟用中 VPN 的 DNS server；無法安全分辨 DNS 歸屬，已停止套用。"
-                .to_owned(),
-        ])
-    } else {
-        Ok(servers)
-    }
-}
-
-fn profile_dns_servers(
-    config: &SplitterConfig,
-    vpn: VpnKind,
-    adapters: &[NetworkAdapter],
-    fallback_dns: &[String],
-) -> Result<Vec<String>, Vec<String>> {
-    let adapter = selected_adapter_for_profile(config, vpn, adapters)?;
-    let fallback_dns = fallback_dns.iter().collect::<BTreeSet<_>>();
-    let servers = normalized_ipv4_servers(&adapter.dns_servers)
-        .into_iter()
-        .filter(|server| !fallback_dns.contains(server))
-        .collect::<Vec<_>>();
-
-    if servers.is_empty() {
-        Err(vec![format!(
-            "{vpn} 的介面「{}」沒有可與未指定流量路徑分離的 IPv4 DNS server；為避免 DNS 串線，已停止套用。",
-            adapter.description
-        )])
-    } else {
-        Ok(servers)
-    }
-}
-
-fn current_network_dns_servers(
-    adapters: &[NetworkAdapter],
-    internet_gateway: Option<&InternetGateway>,
-) -> Result<Vec<String>, Vec<String>> {
-    let Some(gateway) = internet_gateway else {
-        return Err(vec![
-            "找不到目前 Wi-Fi／有線網路的閘道，無法建立一般 DNS 分流。".to_owned(),
-        ]);
-    };
-    let vpn_dns = adapters
-        .iter()
-        .filter(|adapter| adapter.is_up())
-        .flat_map(|adapter| normalized_ipv4_servers(&adapter.dns_servers))
-        .collect::<BTreeSet<_>>();
-    let active_physical_dns = normalized_ipv4_servers(&gateway.dns_servers)
-        .into_iter()
-        .filter(|server| !vpn_dns.contains(server))
-        .collect::<Vec<_>>();
-    let physical_dns = if active_physical_dns.is_empty() {
-        normalized_ipv4_servers(&gateway.fallback_dns_servers)
-            .into_iter()
-            .filter(|server| !vpn_dns.contains(server))
-            .collect::<Vec<_>>()
-    } else {
-        active_physical_dns
-    };
-
-    if physical_dns.is_empty() {
-        return Err(vec![format!(
-            "{} 沒有可辨識的一般網路 IPv4 DNS server；為避免讓未指定服務繼續使用 VPN DNS，已停止啟用分流。",
-            gateway.interface_alias
-        )]);
-    }
-
-    Ok(physical_dns)
-}
-
-fn append_dns_policy(
-    prepared: &mut PreparedRoutes,
-    validated: &[ValidatedProfile],
-    config: &SplitterConfig,
-    adapters: &[NetworkAdapter],
-    fallback: InternetFallback<'_>,
-    fallback_dns: &[String],
-) -> Result<(), Vec<String>> {
-    prepared.dns_rules.push(ManagedDnsRule {
-        vpn: None,
-        namespaces: vec![".".to_owned()],
-        name_servers: fallback_dns.to_vec(),
-    });
-
-    for server in fallback_dns {
-        let address = server
-            .parse::<Ipv4Addr>()
-            .expect("fallback DNS servers are normalized IPv4 addresses");
-        if let Some(route) = prepared.routes.iter().find(|route| {
-            route.purpose == ManagedRoutePurpose::Target
-                && route
-                    .prefix
-                    .parse::<ipnet::Ipv4Net>()
-                    .is_ok_and(|network| network.contains(&address))
-        }) {
-            return Err(vec![format!(
-                "未指定名稱所使用的 {} DNS {address} 被 {} 的目標「{}」涵蓋；這會改變未啟用分流時的 DNS 行為，已停止套用。",
-                fallback.label(),
-                route.vpn,
-                route.prefix
-            )]);
-        }
-    }
-
-    for profile in validated
-        .iter()
-        .filter(|profile| !profile.hostnames.is_empty())
-    {
-        let adapter = selected_adapter_for_profile(config, profile.vpn, adapters)?;
-        let vpn_dns = profile_dns_servers(config, profile.vpn, adapters, fallback_dns)?;
-
-        prepared.dns_rules.push(ManagedDnsRule {
-            vpn: Some(profile.vpn),
-            namespaces: profile.hostnames.clone(),
-            name_servers: vpn_dns.clone(),
-        });
-
-        for server in vpn_dns {
-            let address = server
-                .parse::<Ipv4Addr>()
-                .expect("VPN DNS servers are normalized IPv4 addresses");
-            if let Some(route) = prepared.routes.iter().find(|route| {
-                route.vpn != profile.vpn
-                    && route.purpose == ManagedRoutePurpose::Target
-                    && route
-                        .prefix
-                        .parse::<ipnet::Ipv4Net>()
-                        .is_ok_and(|network| network.contains(&address))
-            }) {
-                return Err(vec![format!(
-                    "{} 的 DNS server {address} 被 {} 的目標「{}」涵蓋，無法同時建立正確 DNS 路由。",
-                    profile.vpn, route.vpn, route.prefix
-                )]);
-            }
-
-            let covered_by_own_target = prepared.routes.iter().any(|route| {
-                route.vpn == profile.vpn
-                    && route.purpose == ManagedRoutePurpose::Target
-                    && route
-                        .prefix
-                        .parse::<ipnet::Ipv4Net>()
-                        .is_ok_and(|network| network.contains(&address))
-            });
-            if covered_by_own_target {
-                continue;
-            }
-
-            let prefix = format!("{address}/32");
-            if let Some(existing) = prepared.routes.iter().find(|route| {
-                route.purpose == ManagedRoutePurpose::VpnDnsServer && route.prefix == prefix
-            }) {
-                return Err(vec![format!(
-                    "{} 與 {} 使用同一個 VPN DNS server {address}，但 Windows 只能選擇一條介面路由。",
-                    existing.vpn, profile.vpn
-                )]);
-            }
-            prepared.routes.push(ManagedRoute {
-                vpn: profile.vpn,
-                purpose: ManagedRoutePurpose::VpnDnsServer,
-                prefix,
-                interface_index: adapter.index,
-                next_hop: adapter.next_hop.clone(),
-                route_metric: ROUTE_METRIC,
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn enabled_full_tunnel_vpns(config: &SplitterConfig, adapters: &[NetworkAdapter]) -> Vec<VpnKind> {
-    config
-        .profiles
-        .iter()
-        .filter(|profile| profile.enabled)
-        .filter_map(|profile| {
-            let description = profile.adapter_description.as_ref()?;
-            adapters
-                .iter()
-                .find(|adapter| {
-                    adapter.matches(profile.vpn)
-                        && &adapter.description == description
-                        && adapter.is_up()
-                        && adapter.full_tunnel_priority.is_some()
-                })
-                .map(|_| profile.vpn)
-        })
-        .collect()
-}
-
-fn should_manage_dns_policy(
-    config: &SplitterConfig,
-    full_tunnel_vpns: &[VpnKind],
-    fallback: Option<InternetFallback<'_>>,
-) -> bool {
-    !full_tunnel_vpns.is_empty()
-        || has_enabled_dns_targets(config)
-        || matches!(fallback, Some(InternetFallback::Vpn { .. }))
-}
-
-fn internet_bypass_routes_are_required(
-    config: &SplitterConfig,
-    adapters: &[NetworkAdapter],
-    full_tunnel_vpns: &[VpnKind],
-    fallback: InternetFallback<'_>,
-) -> bool {
-    full_tunnel_vpns.iter().any(|vpn| {
-        let Some(adapter) = config
-            .profile(*vpn)
-            .and_then(|profile| profile.adapter_description.as_ref())
-            .and_then(|description| {
-                adapters.iter().find(|adapter| {
-                    adapter.matches(*vpn)
-                        && &adapter.description == description
-                        && adapter.is_up()
-                        && adapter.full_tunnel_priority.is_some()
-                })
-            })
-        else {
-            return true;
-        };
-        let enabled_tunnel = InternetFallback::Vpn { vpn: *vpn, adapter };
-        !fallback_is_preferred(fallback, enabled_tunnel)
-    })
-}
-
-fn append_internet_bypass_routes(
-    prepared: &mut PreparedRoutes,
-    config: &SplitterConfig,
-    adapters: &[NetworkAdapter],
-    full_tunnel_vpns: &[VpnKind],
-    fallback: Option<InternetFallback<'_>>,
-) -> Result<(), Vec<String>> {
-    let Some(&owner) = full_tunnel_vpns.first() else {
-        return Ok(());
-    };
-    let names = full_tunnel_vpns
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("、");
-    let tunnel_state = if full_tunnel_vpns.len() == 1 {
-        format!("{names} 是")
-    } else {
-        format!("{names} 同時是")
-    };
-    let Some(fallback) = fallback else {
-        return Err(vec![format!(
-            "{tunnel_state} Full Tunnel，但找不到可接手未指定流量的原生 VPN 或一般網路；為避免套用後仍無法連線，已停止。請按「重新偵測 VPN」後再試。"
-        )]);
-    };
-
-    let source = if fallback.inferred_from_escape_route() {
-        "（由 VPN 保留的伺服器繞行路由推定）"
-    } else {
-        ""
-    };
-    if internet_bypass_routes_are_required(config, adapters, full_tunnel_vpns, fallback) {
-        prepared
-            .routes
-            .extend(INTERNET_BYPASS_PREFIXES.map(|prefix| ManagedRoute {
-                vpn: owner,
-                purpose: ManagedRoutePurpose::InternetBypass,
-                prefix: prefix.to_owned(),
-                interface_index: fallback.interface_index(),
-                next_hop: fallback.next_hop().to_owned(),
-                route_metric: ROUTE_METRIC,
-            }));
-        prepared.warnings.push(format!(
-            "{tunnel_state} Full Tunnel；非指定 IPv4 流量會透過 {} 保留原生選路{}。若 VPN 公司策略強制封鎖繞行，連線仍可能受限。",
-            fallback.label(), source
-        ));
-    } else {
-        prepared.warnings.push(format!(
-            "{tunnel_state} Full Tunnel；{} 的原生路由已優先處理非指定 IPv4 流量，本程式不會建立重複的全網路 fallback 路由。",
-            fallback.label()
-        ));
-    }
-
-    Ok(())
-}
-
-fn prepare_validated_profile_routes(
-    config: &SplitterConfig,
-    validated_profile: &ValidatedProfile,
-    adapters: &[NetworkAdapter],
-) -> Result<Vec<ManagedRoute>, Vec<String>> {
-    let profile = config
-        .profile(validated_profile.vpn)
-        .expect("validated profiles originate from config");
-    let adapter = selected_adapter_for_profile(config, profile.vpn, adapters)?;
-
-    Ok(validated_profile
-        .networks
-        .iter()
-        .map(|network| ManagedRoute {
-            vpn: profile.vpn,
-            purpose: ManagedRoutePurpose::Target,
-            prefix: network.to_string(),
-            interface_index: adapter.index,
-            next_hop: adapter.next_hop.clone(),
-            route_metric: ROUTE_METRIC,
-        })
-        .collect())
-}
-
 fn run_toggle(
-    current_routes: Vec<ManagedRoute>,
+    mut current_routes: Vec<ManagedRoute>,
     mut next_config: SplitterConfig,
     vpn: VpnKind,
     enabled: bool,
+    state_path: PathBuf,
     cancellation: Arc<AtomicBool>,
 ) -> OperationResult {
     let Some(profile) = next_config.profile_mut(vpn) else {
@@ -1263,6 +311,13 @@ fn run_toggle(
         });
     };
     profile.enabled = enabled;
+    let journal_path = route_journal_path(&state_path);
+    if let Err(error) = merge_route_journal(&mut current_routes, &journal_path) {
+        return OperationResult::Toggle(ToggleOutcome::Failed {
+            attempted_enabled: enabled,
+            error: format!("套用前無法讀取路由復原日誌：{error}\n開關已恢復原狀。"),
+        });
+    }
 
     let snapshot = match discover_network_snapshot(&cancellation) {
         Ok(snapshot) => snapshot,
@@ -1279,6 +334,8 @@ fn run_toggle(
         &next_config,
         &snapshot.adapters,
         snapshot.internet_gateway.as_ref(),
+        &snapshot.native_routes,
+        &journal_path,
     ) {
         Ok(applied) => OperationResult::Toggle(ToggleOutcome::Applied {
             vpn,
@@ -1295,10 +352,20 @@ fn run_toggle(
 }
 
 fn run_dns_refresh(
-    current_routes: Vec<ManagedRoute>,
+    mut current_routes: Vec<ManagedRoute>,
     config: SplitterConfig,
+    state_path: PathBuf,
     cancellation: Arc<AtomicBool>,
 ) -> OperationResult {
+    let journal_path = route_journal_path(&state_path);
+    let recovered = match merge_route_journal(&mut current_routes, &journal_path) {
+        Ok(recovered) => recovered,
+        Err(error) => {
+            return OperationResult::RefreshDns(DnsRefreshOutcome::Failed(format!(
+                "自動更新 DNS 前無法讀取路由復原日誌：{error}"
+            )));
+        }
+    };
     let snapshot = match discover_network_snapshot(&cancellation) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -1312,8 +379,10 @@ fn run_dns_refresh(
         &config,
         &snapshot.adapters,
         snapshot.internet_gateway.as_ref(),
+        &snapshot.native_routes,
+        &journal_path,
     ) {
-        Ok(AppliedPolicy { changed: false, .. }) => {
+        Ok(AppliedPolicy { changed: false, .. }) if !recovered => {
             OperationResult::RefreshDns(DnsRefreshOutcome::Unchanged)
         }
         Ok(applied) => OperationResult::RefreshDns(DnsRefreshOutcome::Updated {
@@ -1326,181 +395,26 @@ fn run_dns_refresh(
     }
 }
 
-fn desired_routes_for_health_check(
-    current_routes: &[ManagedRoute],
-    mut config: SplitterConfig,
-    adapters: &[NetworkAdapter],
-    internet_gateway: Option<&InternetGateway>,
-) -> Result<RouteHealthPlan, String> {
-    let mut desired_routes = Vec::new();
-    let mut disabled_vpns = Vec::new();
-    let mut warnings = Vec::new();
-    let mut full_tunnel_vpns = Vec::new();
-
-    for vpn in VpnKind::ALL {
-        let Some(profile) = config.profile(vpn) else {
-            continue;
-        };
-        if !profile.enabled {
-            continue;
-        }
-
-        let selected_description = profile.adapter_description.clone();
-        let adapter = selected_description.as_ref().and_then(|description| {
-            adapters.iter().find(|adapter| {
-                adapter.matches(vpn) && &adapter.description == description && adapter.is_up()
-            })
-        });
-        let target_routes = current_routes
-            .iter()
-            .filter(|route| route.vpn == vpn && route.purpose == ManagedRoutePurpose::Target)
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let Some(adapter) = adapter else {
-            if let Some(profile) = config.profile_mut(vpn) {
-                profile.enabled = false;
-            }
-            disabled_vpns.push(vpn);
-            warnings.push(format!(
-                "{vpn} 已斷線或原介面已不存在；已移除其殘留路由並關閉分流。"
-            ));
-            continue;
-        };
-
-        if target_routes.is_empty() {
-            if let Some(profile) = config.profile_mut(vpn) {
-                profile.enabled = false;
-            }
-            disabled_vpns.push(vpn);
-            warnings.push(format!(
-                "{vpn} 的管理路由清單不完整；已清除殘留路由並關閉分流，請重新啟用。"
-            ));
-            continue;
-        }
-
-        desired_routes.extend(target_routes.into_iter().map(|mut route| {
-            route.interface_index = adapter.index;
-            route.next_hop = adapter.next_hop.clone();
-            route
-        }));
-
-        if adapter.full_tunnel_priority.is_some() {
-            full_tunnel_vpns.push(vpn);
-        }
-    }
-
-    let dns_profiles = config
-        .profiles
-        .iter()
-        .filter(|profile| profile.enabled)
-        .map(|profile| {
-            configured_dns_hostnames(profile)
-                .map(|hostnames| ValidatedProfile {
-                    vpn: profile.vpn,
-                    networks: Vec::new(),
-                    hostnames,
-                })
-                .map_err(|error| format!("{} 的 DNS 目標無效：{error}", profile.vpn))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut prepared = PreparedRoutes {
-        routes: desired_routes,
-        dns_rules: Vec::new(),
-        warnings,
-    };
-    let fallback = select_internet_fallback(&config, adapters, internet_gateway);
-    append_internet_bypass_routes(
-        &mut prepared,
-        &config,
-        adapters,
-        &full_tunnel_vpns,
-        fallback,
-    )
-    .map_err(|errors| errors.join("\n"))?;
-    if should_manage_dns_policy(&config, &full_tunnel_vpns, fallback) {
-        let fallback_dns = fallback_dns_servers(&config, fallback, adapters)
-            .map_err(|errors| errors.join("\n"))?;
-        append_dns_policy(
-            &mut prepared,
-            &dns_profiles,
-            &config,
-            adapters,
-            fallback.expect("managed DNS requires a fallback path"),
-            &fallback_dns,
-        )
-        .map_err(|errors| errors.join("\n"))?;
-    }
-
-    Ok(RouteHealthPlan {
-        config,
-        routes: prepared.routes,
-        dns_rules: prepared.dns_rules,
-        disabled_vpns,
-        warnings: prepared.warnings,
-    })
-}
-
-fn evaluate_route_health_with(
-    current_routes: Vec<ManagedRoute>,
-    config: SplitterConfig,
-    existing_routes: Vec<ManagedRoute>,
-    adapters: Vec<NetworkAdapter>,
-    internet_gateway: Option<InternetGateway>,
-    mut apply: impl FnMut(&[ManagedRoute], &[ManagedRoute]) -> Result<(), String>,
-    mut apply_dns: impl FnMut(&[ManagedDnsRule]) -> Result<bool, String>,
-) -> RouteHealthOutcome {
-    let plan = match desired_routes_for_health_check(
-        &current_routes,
-        config,
-        &adapters,
-        internet_gateway.as_ref(),
-    ) {
-        Ok(result) => result,
-        Err(error) => return RouteHealthOutcome::Failed(error),
-    };
-    let routes_repaired = !routes_match(&existing_routes, &plan.routes);
-
-    if routes_repaired && let Err(error) = apply(&existing_routes, &plan.routes) {
-        return RouteHealthOutcome::Failed(format!(
-            "自動修復分流路由失敗；將於下次健康檢查重試：{error}"
-        ));
-    }
-    let dns_repaired = match apply_dns(&plan.dns_rules) {
-        Ok(changed) => changed,
-        Err(error) => {
-            return RouteHealthOutcome::Failed(format!(
-                "自動修復 DNS 分流失敗；將於下次健康檢查重試：{error}"
-            ));
-        }
-    };
-
-    RouteHealthOutcome::Updated {
-        config: plan.config,
-        routes: plan.routes,
-        adapters,
-        internet_gateway: internet_gateway.map(Box::new),
-        repaired: routes_repaired || dns_repaired,
-        disabled_vpns: plan.disabled_vpns,
-        warnings: plan.warnings,
-    }
-}
-
-fn endpoint_refresh_required(
-    scheduled_refresh: bool,
-    previous_fingerprint: Option<RouteTableFingerprint>,
-    current_fingerprint: RouteTableFingerprint,
-) -> bool {
-    scheduled_refresh || previous_fingerprint != Some(current_fingerprint)
-}
-
 fn run_route_health(
-    current_routes: Vec<ManagedRoute>,
+    mut current_routes: Vec<ManagedRoute>,
     config: SplitterConfig,
     scheduled_endpoint_refresh: bool,
     previous_route_table_fingerprint: Option<RouteTableFingerprint>,
+    state_path: PathBuf,
     cancellation: Arc<AtomicBool>,
 ) -> OperationResult {
+    let journal_path = route_journal_path(&state_path);
+    let recovered = match merge_route_journal(&mut current_routes, &journal_path) {
+        Ok(recovered) => recovered,
+        Err(error) => {
+            return OperationResult::RouteHealth {
+                outcome: RouteHealthOutcome::Failed(format!(
+                    "自動修復前無法讀取路由復原日誌：{error}"
+                )),
+                route_table_fingerprint: None,
+            };
+        }
+    };
     let route_table = match inspect_ipv4_route_table(&current_routes) {
         Ok(inspection) => inspection,
         Err(error) => {
@@ -1519,25 +433,33 @@ fn run_route_health(
         route_table_fingerprint,
     );
 
-    if !refresh_endpoints && routes_match(&route_table.existing_managed_routes, &current_routes) {
+    if !recovered
+        && !refresh_endpoints
+        && routes_match(&route_table.existing_managed_routes, &current_routes)
+    {
         return OperationResult::RouteHealth {
             outcome: RouteHealthOutcome::Healthy,
             route_table_fingerprint: Some(route_table_fingerprint),
         };
     }
 
-    let (adapters, internet_gateway) = thread::scope(|scope| {
+    let (adapters, internet_gateway, native_routes) = thread::scope(|scope| {
         let adapter_cancellation = Arc::clone(&cancellation);
         let adapter_task = scope.spawn(move || discover_vpn_adapters(&adapter_cancellation));
         let gateway_cancellation = Arc::clone(&cancellation);
         let gateway_task = scope.spawn(move || discover_internet_gateway(&gateway_cancellation));
+        let route_cancellation = Arc::clone(&cancellation);
+        let native_route_task = scope.spawn(move || discover_native_routes(&route_cancellation));
         let adapters = adapter_task
             .join()
             .unwrap_or_else(|_| Err("背景偵測 VPN 介面時異常終止。".to_owned()));
         let internet_gateway = gateway_task
             .join()
             .unwrap_or_else(|_| Err("背景偵測一般網路閘道時異常終止。".to_owned()));
-        (adapters, internet_gateway)
+        let native_routes = native_route_task
+            .join()
+            .unwrap_or_else(|_| Err("背景偵測 Windows 原生路由時異常終止。".to_owned()));
+        (adapters, internet_gateway, native_routes)
     });
     let adapters = match adapters {
         Ok(adapters) => adapters,
@@ -1561,15 +483,29 @@ fn run_route_health(
             };
         }
     };
+    let native_routes = match native_routes {
+        Ok(routes) => routes,
+        Err(error) => {
+            return OperationResult::RouteHealth {
+                outcome: RouteHealthOutcome::Failed(format!(
+                    "自動修復前無法重新偵測 Windows 原生路由：{error}"
+                )),
+                route_table_fingerprint: Some(route_table_fingerprint),
+            };
+        }
+    };
 
     OperationResult::RouteHealth {
-        outcome: evaluate_route_health_with(
-            current_routes,
-            config,
-            route_table.existing_managed_routes,
-            adapters,
-            internet_gateway,
-            |previous, desired| apply_routes(previous, desired).map(|_| ()),
+        outcome: evaluate_route_health_with_native_routes(
+            RouteHealthInput {
+                current_routes,
+                config,
+                existing_routes: route_table.existing_managed_routes,
+                adapters,
+                internet_gateway,
+                native_routes,
+            },
+            |previous, desired| journaled_route_change(&journal_path, previous, desired),
             |rules| apply_dns_policy(rules).map(|result| result.changed),
         ),
         route_table_fingerprint: Some(route_table_fingerprint),
@@ -1689,8 +625,9 @@ impl SplitterApp {
         self.next_endpoint_refresh_at = Instant::now();
         let previous = self.state.managed_routes.clone();
         let config = self.state.config.clone();
+        let state_path = self.state_path.clone();
         self.start_operation(OperationKind::RefreshAdapters, move |cancellation| {
-            run_refresh(previous, config, cancellation)
+            run_refresh(previous, config, state_path, cancellation)
         });
     }
 
@@ -1782,10 +719,8 @@ impl SplitterApp {
             Ok(reconciled) => {
                 self.state.managed_routes = reconciled.routes;
                 self.sync_enabled_profiles_to_routes();
-                if reconciled.removed > 0 {
-                    let _ = save_state(&self.state_path, &self.state);
-                }
-                Ok(reconciled.removed)
+                self.save_state_and_clear_route_journal()
+                    .map(|()| reconciled.removed)
             }
             Err(error) => Err(error),
         };
@@ -1855,7 +790,7 @@ impl SplitterApp {
                     format!("{vpn} 分流已關閉，本程式建立的相關路由已移除。")
                 };
                 self.banner = Banner::Success(format!("{message}{warning_text}"));
-                if let Err(error) = save_state(&self.state_path, &self.state) {
+                if let Err(error) = self.save_state_and_clear_route_journal() {
                     self.banner = Banner::Error(format!("路由已套用，但設定保存失敗：{error}"));
                 }
             }
@@ -1912,7 +847,11 @@ impl SplitterApp {
 
     fn finish_dns_refresh(&mut self, outcome: DnsRefreshOutcome) {
         match outcome {
-            DnsRefreshOutcome::Unchanged => {}
+            DnsRefreshOutcome::Unchanged => {
+                if let Err(error) = clear_route_journal(&route_journal_path(&self.state_path)) {
+                    self.banner = Banner::Error(error);
+                }
+            }
             DnsRefreshOutcome::Updated { routes, warnings } => {
                 self.state.managed_routes = routes;
                 let warning_text = if warnings.is_empty() {
@@ -1925,7 +864,7 @@ impl SplitterApp {
                     self.state.managed_routes.len(),
                     warning_text
                 ));
-                if let Err(error) = save_state(&self.state_path, &self.state) {
+                if let Err(error) = self.save_state_and_clear_route_journal() {
                     self.banner = Banner::Error(format!("DNS 路由已更新，但設定保存失敗：{error}"));
                 }
             }
@@ -1949,7 +888,11 @@ impl SplitterApp {
                 .min(Instant::now() + ROUTE_HEALTH_INTERVAL);
         }
         match outcome {
-            RouteHealthOutcome::Healthy => {}
+            RouteHealthOutcome::Healthy => {
+                if let Err(error) = clear_route_journal(&route_journal_path(&self.state_path)) {
+                    self.banner = Banner::Error(error);
+                }
+            }
             RouteHealthOutcome::Updated {
                 config,
                 routes,
@@ -1964,21 +907,20 @@ impl SplitterApp {
                         config.profile(*vpn).is_some_and(|profile| !profile.enabled)
                     })
                 );
-                let mut state_changed = self.state.managed_routes != routes;
                 for vpn in &disabled_vpns {
                     if let Some(profile) = self.state.config.profile_mut(*vpn)
                         && profile.enabled
                     {
                         profile.enabled = false;
-                        state_changed = true;
                     }
                 }
                 self.state.managed_routes = routes;
                 self.adapters = adapters;
                 self.internet_gateway = internet_gateway.map(|gateway| *gateway);
 
-                if state_changed {
-                    let _ = save_state(&self.state_path, &self.state);
+                if let Err(error) = self.save_state_and_clear_route_journal() {
+                    self.banner = Banner::Error(format!("路由健康狀態保存失敗：{error}"));
+                    return;
                 }
                 if !disabled_vpns.is_empty() {
                     self.banner = Banner::Info(warnings.join("\n"));
@@ -2365,12 +1307,14 @@ impl SplitterApp {
         let current_routes = self.state.managed_routes.clone();
         let config = self.state.config.clone();
         let previous_route_table_fingerprint = self.route_table_fingerprint;
+        let state_path = self.state_path.clone();
         self.start_operation(OperationKind::RouteHealth, move |cancellation| {
             run_route_health(
                 current_routes,
                 config,
                 refresh_endpoints,
                 previous_route_table_fingerprint,
+                state_path,
                 cancellation,
             )
         });
@@ -2387,8 +1331,9 @@ impl SplitterApp {
         self.next_dns_refresh_at = now + DNS_REFRESH_INTERVAL;
         let current_routes = self.state.managed_routes.clone();
         let config = self.state.config.clone();
+        let state_path = self.state_path.clone();
         self.start_operation(OperationKind::RefreshDns, move |cancellation| {
-            run_dns_refresh(current_routes, config, cancellation)
+            run_dns_refresh(current_routes, config, state_path, cancellation)
         });
     }
 
@@ -2412,14 +1357,29 @@ impl SplitterApp {
         }
         let current_routes = self.state.managed_routes.clone();
         let config = self.state.config.clone();
+        let state_path = self.state_path.clone();
         self.start_operation(
             OperationKind::ToggleProfile { vpn, enabled },
-            move |cancellation| run_toggle(current_routes, config, vpn, enabled, cancellation),
+            move |cancellation| {
+                run_toggle(
+                    current_routes,
+                    config,
+                    vpn,
+                    enabled,
+                    state_path,
+                    cancellation,
+                )
+            },
         );
     }
 
     fn save_to_disk(&self) {
         let _ = save_state(&self.state_path, &self.state);
+    }
+
+    fn save_state_and_clear_route_journal(&self) -> Result<(), String> {
+        save_state(&self.state_path, &self.state)?;
+        clear_route_journal(&route_journal_path(&self.state_path))
     }
 }
 
@@ -2435,6 +1395,8 @@ impl Drop for SplitterApp {
                 self.apply_operation_result(result);
             }
         }
+        let journal_path = route_journal_path(&self.state_path);
+        let journal_loaded = merge_route_journal(&mut self.state.managed_routes, &journal_path);
         let had_active_policy = !self.state.managed_routes.is_empty()
             || self
                 .state
@@ -2442,14 +1404,17 @@ impl Drop for SplitterApp {
                 .profiles
                 .iter()
                 .any(|profile| profile.enabled);
-        let _ = cleanup_managed_routes(&mut self.state);
+        let routes_cleaned = cleanup_managed_routes(&mut self.state);
         let _ = cleanup_dns_policy_on_shutdown_with(
             had_active_policy,
             self.stale_dns_cleanup_pending,
             cancelled_pending_operation,
             || apply_dns_policy(&[]).map(|_| ()),
         );
-        self.save_to_disk();
+        let state_saved = save_state(&self.state_path, &self.state);
+        if journal_loaded.is_ok() && routes_cleaned.is_ok() && state_saved.is_ok() {
+            let _ = clear_route_journal(&journal_path);
+        }
     }
 }
 
@@ -2659,9 +1624,157 @@ fn save_state(path: &Path, state: &PersistedState) -> Result<(), String> {
     fs::write(path, json).map_err(|error| format!("寫入 {} 失敗：{error}", path.display()))
 }
 
+fn route_journal_path(state_path: &Path) -> PathBuf {
+    state_path.with_file_name("pending-routes.jsonl")
+}
+
+fn append_route_journal(path: &Path, routes: &[ManagedRoute]) -> Result<(), String> {
+    if routes.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("建立 {} 失敗：{error}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("開啟路由復原日誌 {} 失敗：{error}", path.display()))?;
+    for route in routes {
+        serde_json::to_writer(&mut file, route)
+            .map_err(|error| format!("序列化路由復原資料失敗：{error}"))?;
+        file.write_all(b"\n")
+            .map_err(|error| format!("寫入路由復原日誌 {} 失敗：{error}", path.display()))?;
+    }
+    file.flush()
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("同步路由復原日誌 {} 失敗：{error}", path.display()))
+}
+
+fn load_route_journal(path: &Path) -> Result<Vec<ManagedRoute>, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!("讀取路由復原日誌 {} 失敗：{error}", path.display()));
+        }
+    };
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut routes = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<ManagedRoute>(line) {
+            Ok(route) => {
+                if !routes.contains(&route) {
+                    routes.push(route);
+                }
+            }
+            Err(_) if index + 1 == lines.len() && !text.ends_with('\n') => {
+                // A killed process can leave only the final line incomplete.
+                // No route change begins until its complete line is synced.
+            }
+            Err(error) => {
+                return Err(format!(
+                    "路由復原日誌 {} 第 {} 行無法解析：{error}",
+                    path.display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    Ok(routes)
+}
+
+fn merge_route_journal(
+    current_routes: &mut Vec<ManagedRoute>,
+    journal_path: &Path,
+) -> Result<bool, String> {
+    let mut recovered = false;
+    for route in load_route_journal(journal_path)? {
+        if !current_routes.contains(&route) {
+            current_routes.push(route);
+            recovered = true;
+        }
+    }
+    Ok(recovered)
+}
+
+fn clear_route_journal(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("清除路由復原日誌 {} 失敗：{error}", path.display())),
+    }
+}
+
+fn journaled_route_change_with(
+    journal_path: &Path,
+    previous: &[ManagedRoute],
+    desired: &[ManagedRoute],
+    inspect_existing: impl FnOnce(&[ManagedRoute]) -> Result<Vec<ManagedRoute>, String>,
+    apply: impl FnOnce(&[ManagedRoute], &[ManagedRoute]) -> Result<(), String>,
+) -> Result<(), String> {
+    let additions = desired
+        .iter()
+        .filter(|route| !previous.contains(route))
+        .cloned()
+        .collect::<Vec<_>>();
+    let preexisting = inspect_existing(&additions)?;
+    if let Some(route) = preexisting.first() {
+        return Err(format!(
+            "路由 {} 已存在相同介面、閘道及 metric 的項目；為避免把非本程式路由寫入復原日誌，已停止套用。",
+            route.prefix
+        ));
+    }
+    append_route_journal(journal_path, &additions)?;
+    apply(previous, desired)
+}
+
+fn journaled_route_change(
+    journal_path: &Path,
+    previous: &[ManagedRoute],
+    desired: &[ManagedRoute],
+) -> Result<(), String> {
+    journaled_route_change_with(
+        journal_path,
+        previous,
+        desired,
+        existing_managed_routes,
+        |previous, desired| apply_routes(previous, desired).map(|_| ()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rust-vpn-splitter-{label}-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("test directory should be created");
+            Self(path)
+        }
+
+        fn state_path(&self) -> PathBuf {
+            self.0.join("state.json")
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn route(vpn: VpnKind, prefix: &str) -> ManagedRoute {
         ManagedRoute {
@@ -2672,6 +1785,58 @@ mod tests {
             next_hop: "0.0.0.0".to_owned(),
             route_metric: ROUTE_METRIC,
         }
+    }
+
+    #[test]
+    fn write_ahead_route_journal_recovers_a_route_applied_before_state_commit() {
+        let directory = TestDirectory::new("route-journal-recovery");
+        let journal_path = route_journal_path(&directory.state_path());
+        let desired = vec![route(VpnKind::F5, "203.0.113.10/32")];
+        let applied = std::cell::Cell::new(false);
+
+        journaled_route_change_with(
+            &journal_path,
+            &[],
+            &desired,
+            |_| Ok(Vec::new()),
+            |_, _| {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .expect("route mutation should complete");
+        assert!(applied.get());
+
+        let mut persisted_inventory = Vec::new();
+        assert!(
+            merge_route_journal(&mut persisted_inventory, &journal_path)
+                .expect("next launch should load the route journal")
+        );
+        assert_eq!(persisted_inventory, desired);
+    }
+
+    #[test]
+    fn preexisting_native_route_is_rejected_before_it_enters_the_journal() {
+        let directory = TestDirectory::new("route-journal-preflight");
+        let journal_path = route_journal_path(&directory.state_path());
+        let desired = vec![route(VpnKind::F5, "203.0.113.10/32")];
+        let applied = std::cell::Cell::new(false);
+
+        let error = journaled_route_change_with(
+            &journal_path,
+            &[],
+            &desired,
+            |additions| Ok(additions.to_vec()),
+            |_, _| {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("an unowned exact route must stop the transaction");
+
+        assert!(error.contains("非本程式路由"));
+        assert!(!applied.get());
+        assert!(load_route_journal(&journal_path).unwrap().is_empty());
     }
 
     fn full_tunnel_app(vpn: VpnKind) -> SplitterApp {
@@ -2917,15 +2082,80 @@ mod tests {
             .routes
             .iter()
             .filter(|route| route.purpose == ManagedRoutePurpose::InternetBypass)
-            .map(|route| route.prefix.as_str())
+            .map(|route| route.prefix.clone())
             .collect::<BTreeSet<_>>();
-        assert_eq!(bypass_prefixes, BTreeSet::from(INTERNET_BYPASS_PREFIXES));
+        assert_eq!(
+            bypass_prefixes,
+            BTreeSet::from(internet_bypass_networks().map(|network| network.to_string()))
+        );
         assert!(native_eighth_routes.iter().all(|native| {
             route_table
                 .borrow()
                 .routes
                 .iter()
                 .any(|route| FakeRouteTable::same_os_route(route, native))
+        }));
+    }
+
+    #[test]
+    fn disabled_split_vpn_wide_route_is_preserved_for_unmatched_traffic() {
+        use std::cell::RefCell;
+
+        let mut app = full_tunnel_app(VpnKind::F5);
+        app.adapters.push(NetworkAdapter {
+            index: 44,
+            name: "FortiClient split fallback".to_owned(),
+            description: "Fortinet SSL VPN Virtual Ethernet Adapter".to_owned(),
+            status: "Up".to_owned(),
+            next_hop: "0.0.0.0".to_owned(),
+            full_tunnel_priority: None,
+            dns_servers: Vec::new(),
+        });
+        let config = enabled_full_tunnel_config(&app, VpnKind::F5);
+        let native_routes = vec![
+            NativeRoute {
+                prefix: "0.0.0.0/3".parse().unwrap(),
+                interface_index: 44,
+                next_hop: "0.0.0.0".to_owned(),
+                route_metric: 1,
+                interface_metric: 1,
+            },
+            NativeRoute {
+                prefix: "0.0.0.0/0".parse().unwrap(),
+                interface_index: 7,
+                next_hop: "192.0.2.1".to_owned(),
+                route_metric: 25,
+                interface_metric: 25,
+            },
+        ];
+        let route_table = RefCell::new(FakeRouteTable::default());
+
+        let applied = apply_policy_transaction_with_native_routes(
+            PolicyTransactionInput {
+                managed_routes: &[],
+                active_routes: &[],
+                config: &config,
+                adapters: &app.adapters,
+                internet_gateway: app.internet_gateway.as_ref(),
+            },
+            &native_routes,
+            |_, hostname, _| panic!("CIDR-only fixture must not resolve {hostname}"),
+            |previous, desired| route_table.borrow_mut().apply(previous, desired),
+            |_| Ok(false),
+        )
+        .expect("native /3 split route should be preserved");
+
+        for prefix in ["0.0.0.0/4", "16.0.0.0/4"] {
+            assert!(applied.prepared.routes.iter().any(|route| {
+                route.purpose == ManagedRoutePurpose::InternetBypass
+                    && route.prefix == prefix
+                    && route.interface_index == 44
+            }));
+        }
+        assert!(applied.prepared.routes.iter().any(|route| {
+            route.purpose == ManagedRoutePurpose::InternetBypass
+                && route.prefix == "32.0.0.0/4"
+                && route.interface_index == 7
         }));
     }
 
@@ -3828,7 +3058,7 @@ mod tests {
                     let fallback = internet_fallback
                         .ok_or_else(|| format!("{vpn} has no unmatched-traffic fallback"))?;
                     if internet_bypasses_required {
-                        if bypasses.len() != INTERNET_BYPASS_PREFIXES.len()
+                        if bypasses.len() != internet_bypass_networks().len()
                             || bypasses.iter().any(|route| {
                                 route.interface_index != fallback.interface_index()
                                     || route.next_hop != fallback.next_hop()
@@ -4978,7 +4208,7 @@ mod tests {
                 .filter(|route| route.purpose == ManagedRoutePurpose::InternetBypass)
                 .collect::<Vec<_>>();
 
-            assert_eq!(bypass_routes.len(), INTERNET_BYPASS_PREFIXES.len());
+            assert_eq!(bypass_routes.len(), internet_bypass_networks().len());
             assert!(bypass_routes.iter().all(|route| {
                 route.vpn == enabled_vpn
                     && route.interface_index == 44
@@ -4999,6 +4229,144 @@ mod tests {
                 "{enabled_vpn} must leave unmatched DNS on disabled {fallback_vpn}"
             );
         }
+    }
+
+    #[test]
+    fn f5_splitter_keeps_disabled_forticlient_gitlab_on_forti_dns_and_tunnel() {
+        let mut app = full_tunnel_app(VpnKind::F5);
+        app.adapters[0].dns_servers = vec!["203.0.113.53".to_owned()];
+        app.adapters[0].full_tunnel_priority = Some(RoutePriority {
+            prefix_length: 3,
+            effective_metric: 5,
+        });
+        app.adapters.push(NetworkAdapter {
+            index: 44,
+            name: "FortiClient fallback".to_owned(),
+            description: "Fortinet SSL VPN Virtual Ethernet Adapter".to_owned(),
+            status: "Up".to_owned(),
+            next_hop: "0.0.0.0".to_owned(),
+            full_tunnel_priority: Some(RoutePriority {
+                prefix_length: 2,
+                effective_metric: 1,
+            }),
+            dns_servers: vec!["10.1.101.31".to_owned()],
+        });
+        let mut config = SplitterConfig::default();
+        let f5 = config.profile_mut(VpnKind::F5).unwrap();
+        f5.enabled = true;
+        f5.adapter_description = Some(app.adapters[0].description.clone());
+        f5.networks = "f5-only.example.test".to_owned();
+        let forti = config.profile_mut(VpnKind::FortiClient).unwrap();
+        forti.enabled = false;
+        forti.adapter_description = Some(app.adapters[1].description.clone());
+        forti.networks = "http://gitlab.twjoin.com:1500/".to_owned();
+
+        let prepared = prepare_all_enabled_routes_with_resolver(
+            &config,
+            &app.adapters,
+            app.internet_gateway.as_ref(),
+            |vpn, hostname, servers| {
+                assert_eq!(vpn, VpnKind::F5);
+                assert_eq!(hostname, "f5-only.example.test");
+                assert_eq!(servers, ["203.0.113.53"]);
+                Ok(vec![Ipv4Addr::new(198, 51, 100, 10)])
+            },
+        )
+        .expect("F5 split policy should preserve Forti as the native fallback");
+
+        assert_eq!(prepared.dns_rules[0].namespaces, vec!["."]);
+        assert_eq!(prepared.dns_rules[0].name_servers, vec!["10.1.101.31"]);
+        assert!(prepared.dns_rules.iter().all(|rule| {
+            !rule
+                .namespaces
+                .iter()
+                .any(|namespace| namespace.contains("gitlab.twjoin.com"))
+        }));
+        assert!(prepared.routes.iter().any(|route| {
+            route.vpn == VpnKind::F5
+                && route.purpose == ManagedRoutePurpose::Target
+                && route.prefix == "198.51.100.10/32"
+        }));
+        assert!(
+            prepared
+                .routes
+                .iter()
+                .filter(|route| { route.purpose == ManagedRoutePurpose::InternetBypass })
+                .all(|route| route.interface_index == 44)
+        );
+    }
+
+    #[test]
+    fn identical_forti_and_ivanti_dns_views_fail_closed_even_for_ip_only_split() {
+        let mut app = full_tunnel_app(VpnKind::FortiClient);
+        app.adapters[0].full_tunnel_priority = None;
+        app.adapters[0].dns_servers = vec!["10.80.0.53".to_owned()];
+        app.adapters.push(NetworkAdapter {
+            index: 55,
+            name: "Ivanti fallback".to_owned(),
+            description: "Pulse Secure Virtual Adapter".to_owned(),
+            status: "Up".to_owned(),
+            next_hop: "0.0.0.0".to_owned(),
+            full_tunnel_priority: Some(RoutePriority {
+                prefix_length: 2,
+                effective_metric: 1,
+            }),
+            dns_servers: vec!["10.80.0.53".to_owned()],
+        });
+        let config = enabled_full_tunnel_config(&app, VpnKind::FortiClient);
+
+        let error = app
+            .prepare_all_enabled_routes(&config)
+            .expect_err("ambiguous DNS ownership must never be guessed");
+
+        assert!(error.join("\n").contains("無法分辨歸屬"));
+    }
+
+    #[test]
+    fn three_vpn_mixed_dns_view_is_partitioned_without_enable_order_dependence() {
+        let mut adapters = dns_isolation_adapters();
+        adapters[0].dns_servers = vec!["10.1.101.31".to_owned()];
+        adapters[1].dns_servers = vec!["163.21.249.166".to_owned()];
+        adapters[2].full_tunnel_priority = Some(RoutePriority {
+            prefix_length: 2,
+            effective_metric: 1,
+        });
+        adapters[2].dns_servers = vec![
+            "10.1.101.31".to_owned(),
+            "163.21.249.166".to_owned(),
+            "10.80.0.53".to_owned(),
+        ];
+        let mut config = SplitterConfig::default();
+        for (vpn, adapter, hostname) in [
+            (VpnKind::FortiClient, &adapters[0], "forti.example.test"),
+            (VpnKind::F5, &adapters[1], "f5.example.test"),
+        ] {
+            let profile = config.profile_mut(vpn).unwrap();
+            profile.enabled = true;
+            profile.adapter_description = Some(adapter.description.clone());
+            profile.networks = hostname.to_owned();
+        }
+
+        let prepared = prepare_all_enabled_routes_with_resolver(
+            &config,
+            &adapters,
+            Some(&physical_gateway()),
+            |vpn, _, servers| {
+                match vpn {
+                    VpnKind::FortiClient => assert_eq!(servers, ["10.1.101.31"]),
+                    VpnKind::F5 => assert_eq!(servers, ["163.21.249.166"]),
+                    VpnKind::Ivanti => unreachable!(),
+                }
+                Ok(vec![match vpn {
+                    VpnKind::FortiClient => Ipv4Addr::new(198, 51, 100, 11),
+                    VpnKind::F5 => Ipv4Addr::new(203, 0, 113, 12),
+                    VpnKind::Ivanti => unreachable!(),
+                }])
+            },
+        )
+        .expect("the unique DNS ownership partition should be stable");
+
+        assert_eq!(prepared.dns_rules[0].name_servers, vec!["10.80.0.53"]);
     }
 
     #[test]
@@ -5287,10 +4655,10 @@ mod tests {
             }),
             dns_servers: vec!["10.1.101.31".to_owned()],
         };
-        let native_forti_routes = INTERNET_BYPASS_PREFIXES.map(|prefix| ManagedRoute {
+        let native_forti_routes = internet_bypass_networks().map(|prefix| ManagedRoute {
             vpn: VpnKind::FortiClient,
             purpose: ManagedRoutePurpose::InternetBypass,
-            prefix: prefix.to_owned(),
+            prefix: prefix.to_string(),
             interface_index: forti_adapter.index,
             next_hop: forti_adapter.next_hop.clone(),
             route_metric: 1,
@@ -5368,11 +4736,11 @@ mod tests {
             // FortiClient can implement Full Tunnel with /2 or /3 routes on
             // both interfaces. The managed bypass must be more specific so
             // it neither collides with those route keys nor loses by metric.
-            for prefix in INTERNET_BYPASS_PREFIXES {
+            for prefix in internet_bypass_networks() {
                 assert!(prepared.routes.contains(&ManagedRoute {
                     vpn,
                     purpose: ManagedRoutePurpose::InternetBypass,
-                    prefix: prefix.to_owned(),
+                    prefix: prefix.to_string(),
                     interface_index: 7,
                     next_hop: "192.0.2.1".to_owned(),
                     route_metric: ROUTE_METRIC,
@@ -5680,7 +5048,7 @@ mod tests {
                                 && route.next_hop == new_gateway.next_hop
                         })
                         .count()
-                        == INTERNET_BYPASS_PREFIXES.len()
+                        == internet_bypass_networks().len()
                 );
                 Ok(())
             },
@@ -5833,7 +5201,7 @@ mod tests {
                         .iter()
                         .filter(|route| route.purpose == ManagedRoutePurpose::InternetBypass)
                         .count(),
-                    INTERNET_BYPASS_PREFIXES.len()
+                    internet_bypass_networks().len()
                 );
                 assert!(desired.iter().all(|route| {
                     route.purpose != ManagedRoutePurpose::InternetBypass
@@ -5853,7 +5221,7 @@ mod tests {
             } => {
                 assert_eq!(apply_calls, 1);
                 assert!(disabled_vpns.is_empty());
-                assert_eq!(routes.len(), 2 + INTERNET_BYPASS_PREFIXES.len());
+                assert_eq!(routes.len(), 2 + internet_bypass_networks().len());
                 assert_eq!(
                     config
                         .profiles
@@ -5959,10 +5327,10 @@ mod tests {
             .iter()
             .filter(|route| route.purpose == ManagedRoutePurpose::InternetBypass)
             .collect::<Vec<_>>();
-        assert_eq!(bypass_routes.len(), INTERNET_BYPASS_PREFIXES.len());
-        for prefix in INTERNET_BYPASS_PREFIXES {
+        assert_eq!(bypass_routes.len(), internet_bypass_networks().len());
+        for prefix in internet_bypass_networks() {
             assert!(bypass_routes.iter().any(|route| {
-                route.prefix == prefix
+                route.prefix == prefix.to_string()
                     && route.interface_index == 7
                     && route.next_hop == "192.0.2.1"
             }));
@@ -6031,7 +5399,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 bypass_routes.len(),
-                INTERNET_BYPASS_PREFIXES.len(),
+                internet_bypass_networks().len(),
                 "{vpns:?} must share one physical bypass set"
             );
             assert!(bypass_routes.iter().all(|route| {
