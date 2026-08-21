@@ -82,6 +82,7 @@ $vpnPattern = '(?i)forti|f5|big-ip|ivanti|juniper|pulse secure'
 # RAS/PPP interfaces can have an empty InterfaceDescription. Map their entry
 # names back to the actual VPN device recorded in the Windows RAS phonebook.
 $rasDevicesByEntry = @{}
+$rasDnsByEntry = @{}
 $phonebookPaths = @()
 if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
     $phonebookPaths += [IO.Path]::Combine(
@@ -110,6 +111,25 @@ foreach ($phonebookPath in @($phonebookPaths | Select-Object -Unique)) {
             [string]$line -cmatch '^Device=(.*)$'
         ) {
             $rasDevicesByEntry[$entryName] = [string]$Matches[1]
+        } elseif (
+            $null -ne $entryName -and
+            [string]$line -match '^IpDns2?Address=(.*)$'
+        ) {
+            $dnsServer = [string]$Matches[1]
+            try {
+                $parsedDns = [ipaddress]$dnsServer
+                if (
+                    $parsedDns.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
+                    $parsedDns.IPAddressToString -ne '0.0.0.0'
+                ) {
+                    $rasDnsByEntry[$entryName] = @(
+                        @($rasDnsByEntry[$entryName]) + $parsedDns.IPAddressToString |
+                            Select-Object -Unique
+                    )
+                }
+            } catch {
+                # Ignore incomplete phonebook values while a RAS client is updating them.
+            }
         }
     }
 }
@@ -126,6 +146,11 @@ $netAdapterCandidates = @(
                 name = [string]$_.Name
                 description = [string]$_.InterfaceDescription
                 status = [string]$_.Status
+                ras_dns_servers = @(
+                    if ($rasDnsByEntry.ContainsKey([string]$_.Name)) {
+                        @($rasDnsByEntry[[string]$_.Name])
+                    }
+                )
             }
         }
 )
@@ -158,6 +183,11 @@ $ipInterfaceCandidates = @(
                     name = $alias
                     description = $description
                     status = if ($connected) { 'Up' } else { 'Disconnected' }
+                    ras_dns_servers = @(
+                        if ($rasDnsByEntry.ContainsKey($alias)) {
+                            @($rasDnsByEntry[$alias])
+                        }
+                    )
                 }
             }
         }
@@ -284,7 +314,7 @@ $adapters = @(
             } else {
                 [string]$gatewayRoute.NextHop
             }
-            $dnsServers = @(
+            $effectiveDnsServers = @(
                 Get-DnsClientServerAddress `
                     -InterfaceIndex ([uint32]$candidate.index) `
                     -AddressFamily IPv4 `
@@ -300,6 +330,12 @@ $adapters = @(
                     } |
                     Select-Object -Unique
             )
+            $rasDnsServers = @($candidate.ras_dns_servers)
+            $dnsServers = if ($rasDnsServers.Count -gt 0) {
+                @($rasDnsServers)
+            } else {
+                @($effectiveDnsServers)
+            }
 
             [pscustomobject]@{
                 index = [uint32]$candidate.index
@@ -1200,6 +1236,8 @@ function Get-Content {
         '[_Common_SSLVPN-NA_V - sslvpn.example.test]',
         'Type=1',
         'MEDIA=rastapi',
+        'IpDnsAddress=203.0.113.53',
+        'IpDns2Address=0.0.0.0',
         'Device=F5 Networks VPN Adapter',
         'DEVICE=rastapi'
     )
@@ -1293,7 +1331,7 @@ function Get-DnsClientServerAddress {
     )
 
     if ($InterfaceIndex -eq 43) {
-        [pscustomobject]@{ ServerAddresses = @('203.0.113.53') }
+        [pscustomobject]@{ ServerAddresses = @('198.51.100.53', '203.0.113.53') }
     }
 }
 "#;

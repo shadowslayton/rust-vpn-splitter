@@ -494,20 +494,18 @@ fn prepare_all_enabled_routes_with_resolver(
 
     let full_tunnel_vpns = enabled_full_tunnel_vpns(config, adapters);
     let fallback = select_internet_fallback(config, adapters, internet_gateway);
-    let manage_dns = should_manage_dns_policy(config, &full_tunnel_vpns);
+    let manage_dns = should_manage_dns_policy(config, &full_tunnel_vpns, fallback);
     let fallback_dns = manage_dns
-        .then(|| fallback_dns_servers(fallback, adapters))
+        .then(|| fallback_dns_servers(config, fallback, adapters))
         .transpose()?;
     let validated = validate_config_with_resolver(config, |vpn, hostname| {
-        let adapter = selected_adapter_for_profile(config, vpn, adapters)
-            .map_err(|errors| errors.join("\n"))?;
-        let vpn_dns = normalized_ipv4_servers(&adapter.dns_servers);
-        if vpn_dns.is_empty() {
-            return Err(format!(
-                "{} 的介面「{}」尚未提供 IPv4 DNS server；不會改用其他 VPN 或一般網路 DNS。",
-                vpn, adapter.description
-            ));
-        }
+        let vpn_dns = profile_dns_servers(
+            config,
+            vpn,
+            adapters,
+            fallback_dns.as_deref().unwrap_or_default(),
+        )
+        .map_err(|errors| errors.join("\n"))?;
         resolve_hostname(vpn, hostname, &vpn_dns)
     })
     .map_err(|errors| {
@@ -586,6 +584,7 @@ fn normalized_ipv4_servers(servers: &[String]) -> Vec<String> {
 fn configured_vpn_dns_routes(
     config: &SplitterConfig,
     adapters: &[NetworkAdapter],
+    fallback_dns: &[String],
 ) -> Result<Vec<ManagedRoute>, Vec<String>> {
     let mut routes: Vec<ManagedRoute> = Vec::new();
 
@@ -597,13 +596,7 @@ fn configured_vpn_dns_routes(
         }
 
         let adapter = selected_adapter_for_profile(config, profile.vpn, adapters)?;
-        let vpn_dns = normalized_ipv4_servers(&adapter.dns_servers);
-        if vpn_dns.is_empty() {
-            return Err(vec![format!(
-                "{} 的介面「{}」尚未提供 IPv4 DNS server；為避免把其網域交給其他 VPN 或一般網路 DNS，已停止套用。請按「重新偵測 VPN」後再試。",
-                profile.vpn, adapter.description
-            )]);
-        }
+        let vpn_dns = profile_dns_servers(config, profile.vpn, adapters, fallback_dns)?;
         for server in vpn_dns {
             let prefix = format!("{server}/32");
             if let Some(existing) = routes.iter().find(|route| route.prefix == prefix) {
@@ -648,11 +641,16 @@ fn validate_dns_hostname_ownership(config: &SplitterConfig) -> Result<(), Vec<St
 fn validate_vpn_dns_server_ownership(
     config: &SplitterConfig,
     adapters: &[NetworkAdapter],
+    fallback_dns: &[String],
 ) -> Result<(), Vec<String>> {
     let mut owners = BTreeMap::new();
     for profile in config.profiles.iter().filter(|profile| profile.enabled) {
-        let adapter = selected_adapter_for_profile(config, profile.vpn, adapters)?;
-        for server in normalized_ipv4_servers(&adapter.dns_servers) {
+        let hostnames = configured_dns_hostnames(profile)
+            .map_err(|error| vec![format!("{} 的 DNS 目標無效：{error}", profile.vpn)])?;
+        if hostnames.is_empty() {
+            continue;
+        }
+        for server in profile_dns_servers(config, profile.vpn, adapters, fallback_dns)? {
             if let Some(existing_vpn) = owners.insert(server.clone(), profile.vpn)
                 && existing_vpn != profile.vpn
             {
@@ -759,10 +757,18 @@ fn apply_policy_transaction_with(
         adapters,
         internet_gateway,
     } = input;
+    let full_tunnel_vpns = enabled_full_tunnel_vpns(config, adapters);
+    let fallback = select_internet_fallback(config, adapters, internet_gateway);
+    let fallback_dns = should_manage_dns_policy(config, &full_tunnel_vpns, fallback)
+        .then(|| fallback_dns_servers(config, fallback, adapters))
+        .transpose()
+        .map_err(|errors| errors.join("\n"))?
+        .unwrap_or_default();
     validate_dns_hostname_ownership(config).map_err(|errors| errors.join("\n"))?;
-    validate_vpn_dns_server_ownership(config, adapters).map_err(|errors| errors.join("\n"))?;
-    let bootstrap_routes =
-        configured_vpn_dns_routes(config, adapters).map_err(|errors| errors.join("\n"))?;
+    validate_vpn_dns_server_ownership(config, adapters, &fallback_dns)
+        .map_err(|errors| errors.join("\n"))?;
+    let bootstrap_routes = configured_vpn_dns_routes(config, adapters, &fallback_dns)
+        .map_err(|errors| errors.join("\n"))?;
     validate_dns_route_target_conflicts(config, &bootstrap_routes)
         .map_err(|errors| errors.join("\n"))?;
     let staged_routes = routes_with_dns_bootstrap(managed_routes, bootstrap_routes);
@@ -894,27 +900,79 @@ fn select_internet_fallback<'a>(
 }
 
 fn fallback_dns_servers(
+    config: &SplitterConfig,
     fallback: Option<InternetFallback<'_>>,
     adapters: &[NetworkAdapter],
 ) -> Result<Vec<String>, Vec<String>> {
-    match fallback {
+    let mut servers = match fallback {
         Some(InternetFallback::Physical(gateway)) => {
-            current_network_dns_servers(adapters, Some(gateway))
+            current_network_dns_servers(adapters, Some(gateway))?
         }
         Some(InternetFallback::Vpn { vpn, adapter }) => {
             let servers = normalized_ipv4_servers(&adapter.dns_servers);
             if servers.is_empty() {
-                Err(vec![format!(
+                return Err(vec![format!(
                     "{vpn} 已連線且其原生通道應處理未指定流量，但介面「{}」沒有可辨識的 IPv4 DNS server；為避免改變未啟用分流時的 DNS 行為，已停止套用。",
                     adapter.description
-                )])
-            } else {
-                Ok(servers)
+                )]);
             }
+            servers
         }
-        None => Err(vec![
-            "找不到可接手未指定流量的原生 VPN 或一般網路，已停止套用。".to_owned(),
-        ]),
+        None => {
+            return Err(vec![
+                "找不到可接手未指定流量的原生 VPN 或一般網路，已停止套用。".to_owned(),
+            ]);
+        }
+    };
+
+    for profile in config.profiles.iter().filter(|profile| profile.enabled) {
+        let Some(description) = profile.adapter_description.as_ref() else {
+            continue;
+        };
+        let Some(adapter) = adapters.iter().find(|adapter| {
+            adapter.matches(profile.vpn) && &adapter.description == description && adapter.is_up()
+        }) else {
+            continue;
+        };
+        let profile_servers = normalized_ipv4_servers(&adapter.dns_servers);
+        let fallback_is_subset = servers
+            .iter()
+            .all(|server| profile_servers.contains(server));
+        if !fallback_is_subset {
+            servers.retain(|server| !profile_servers.contains(server));
+        }
+    }
+
+    if servers.is_empty() {
+        Err(vec![
+            "接手未指定流量的網路介面只回報了啟用中 VPN 的 DNS server；無法安全分辨 DNS 歸屬，已停止套用。"
+                .to_owned(),
+        ])
+    } else {
+        Ok(servers)
+    }
+}
+
+fn profile_dns_servers(
+    config: &SplitterConfig,
+    vpn: VpnKind,
+    adapters: &[NetworkAdapter],
+    fallback_dns: &[String],
+) -> Result<Vec<String>, Vec<String>> {
+    let adapter = selected_adapter_for_profile(config, vpn, adapters)?;
+    let fallback_dns = fallback_dns.iter().collect::<BTreeSet<_>>();
+    let servers = normalized_ipv4_servers(&adapter.dns_servers)
+        .into_iter()
+        .filter(|server| !fallback_dns.contains(server))
+        .collect::<Vec<_>>();
+
+    if servers.is_empty() {
+        Err(vec![format!(
+            "{vpn} 的介面「{}」沒有可與未指定流量路徑分離的 IPv4 DNS server；為避免 DNS 串線，已停止套用。",
+            adapter.description
+        )])
+    } else {
+        Ok(servers)
     }
 }
 
@@ -994,13 +1052,7 @@ fn append_dns_policy(
         .filter(|profile| !profile.hostnames.is_empty())
     {
         let adapter = selected_adapter_for_profile(config, profile.vpn, adapters)?;
-        let vpn_dns = normalized_ipv4_servers(&adapter.dns_servers);
-        if vpn_dns.is_empty() {
-            return Err(vec![format!(
-                "{} 的介面「{}」尚未提供 IPv4 DNS server；不會建立可能串線的 DNS 規則。",
-                profile.vpn, adapter.description
-            )]);
-        }
+        let vpn_dns = profile_dns_servers(config, profile.vpn, adapters, fallback_dns)?;
 
         prepared.dns_rules.push(ManagedDnsRule {
             vpn: Some(profile.vpn),
@@ -1081,8 +1133,14 @@ fn enabled_full_tunnel_vpns(config: &SplitterConfig, adapters: &[NetworkAdapter]
         .collect()
 }
 
-fn should_manage_dns_policy(config: &SplitterConfig, full_tunnel_vpns: &[VpnKind]) -> bool {
-    !full_tunnel_vpns.is_empty() || has_enabled_dns_targets(config)
+fn should_manage_dns_policy(
+    config: &SplitterConfig,
+    full_tunnel_vpns: &[VpnKind],
+    fallback: Option<InternetFallback<'_>>,
+) -> bool {
+    !full_tunnel_vpns.is_empty()
+        || has_enabled_dns_targets(config)
+        || matches!(fallback, Some(InternetFallback::Vpn { .. }))
 }
 
 fn internet_bypass_routes_are_required(
@@ -1360,9 +1418,9 @@ fn desired_routes_for_health_check(
         fallback,
     )
     .map_err(|errors| errors.join("\n"))?;
-    if should_manage_dns_policy(&config, &full_tunnel_vpns) {
-        let fallback_dns =
-            fallback_dns_servers(fallback, adapters).map_err(|errors| errors.join("\n"))?;
+    if should_manage_dns_policy(&config, &full_tunnel_vpns, fallback) {
+        let fallback_dns = fallback_dns_servers(&config, fallback, adapters)
+            .map_err(|errors| errors.join("\n"))?;
         append_dns_policy(
             &mut prepared,
             &dns_profiles,
@@ -1880,8 +1938,15 @@ impl SplitterApp {
         outcome: RouteHealthOutcome,
         route_table_fingerprint: Option<RouteTableFingerprint>,
     ) {
+        let route_table_changed = route_table_fingerprint
+            .is_some_and(|fingerprint| self.route_table_fingerprint != Some(fingerprint));
         if let Some(fingerprint) = route_table_fingerprint {
             self.route_table_fingerprint = Some(fingerprint);
+        }
+        if route_table_changed {
+            self.next_endpoint_refresh_at = self
+                .next_endpoint_refresh_at
+                .min(Instant::now() + ROUTE_HEALTH_INTERVAL);
         }
         match outcome {
             RouteHealthOutcome::Healthy => {}
@@ -3255,7 +3320,7 @@ mod tests {
         let f5 = config.profile_mut(VpnKind::F5).expect("F5 profile exists");
         f5.enabled = true;
         f5.adapter_description = Some(adapters[1].description.clone());
-        f5.networks = "203.0.113.10/32".to_owned();
+        f5.networks = "f5.example.test".to_owned();
         let route_changes = Cell::new(0);
 
         let error = apply_policy_transaction_with(
@@ -4709,6 +4774,24 @@ mod tests {
     }
 
     #[test]
+    fn route_table_change_schedules_a_follow_up_endpoint_refresh() {
+        let mut app = full_tunnel_app(VpnKind::F5);
+        let previous = RouteTableFingerprint::from_test_value(7);
+        let changed = RouteTableFingerprint::from_test_value(8);
+        app.route_table_fingerprint = Some(previous);
+        app.next_endpoint_refresh_at = Instant::now() + ENDPOINT_REFRESH_INTERVAL;
+        let latest_expected_refresh =
+            Instant::now() + ROUTE_HEALTH_INTERVAL + Duration::from_millis(100);
+
+        app.finish_route_health(RouteHealthOutcome::Healthy, Some(changed));
+
+        assert!(
+            app.next_endpoint_refresh_at <= latest_expected_refresh,
+            "VPN routes can arrive before adapter status and DNS; endpoint discovery must retry"
+        );
+    }
+
+    #[test]
     fn shutdown_cleanup_retries_a_transient_route_removal_failure() {
         let mut state = PersistedState::default();
         state
@@ -4915,6 +4998,128 @@ mod tests {
                 vec!["198.51.100.53"],
                 "{enabled_vpn} must leave unmatched DNS on disabled {fallback_vpn}"
             );
+        }
+    }
+
+    #[test]
+    fn disabled_full_tunnel_fallback_owns_unmatched_dns_during_route_convergence() {
+        for (enabled_vpn, fallback_vpn) in [
+            (VpnKind::FortiClient, VpnKind::F5),
+            (VpnKind::FortiClient, VpnKind::Ivanti),
+            (VpnKind::F5, VpnKind::FortiClient),
+            (VpnKind::F5, VpnKind::Ivanti),
+            (VpnKind::Ivanti, VpnKind::FortiClient),
+            (VpnKind::Ivanti, VpnKind::F5),
+        ] {
+            let mut app = full_tunnel_app(enabled_vpn);
+            app.adapters[0].full_tunnel_priority = None;
+            app.adapters[0].dns_servers = vec!["203.0.113.53".to_owned()];
+            let (name, description) = match fallback_vpn {
+                VpnKind::FortiClient => (
+                    "FortiClient fallback",
+                    "Fortinet SSL VPN Virtual Ethernet Adapter",
+                ),
+                VpnKind::F5 => ("F5 fallback", "F5 Networks VPN Adapter"),
+                VpnKind::Ivanti => ("Ivanti fallback", "Pulse Secure Virtual Adapter"),
+            };
+            app.adapters.push(NetworkAdapter {
+                index: 44,
+                name: name.to_owned(),
+                description: description.to_owned(),
+                status: "Up".to_owned(),
+                next_hop: "0.0.0.0".to_owned(),
+                full_tunnel_priority: Some(RoutePriority {
+                    prefix_length: 2,
+                    effective_metric: 1,
+                }),
+                dns_servers: vec!["203.0.113.53".to_owned(), "198.51.100.53".to_owned()],
+            });
+            let config = enabled_full_tunnel_config(&app, enabled_vpn);
+
+            let prepared = app
+                .prepare_all_enabled_routes(&config)
+                .expect("a connected disabled VPN must remain the native fallback");
+
+            assert_eq!(
+                prepared.dns_rules.len(),
+                1,
+                "{enabled_vpn} -> {fallback_vpn}"
+            );
+            assert_eq!(prepared.dns_rules[0].vpn, None);
+            assert_eq!(prepared.dns_rules[0].namespaces, vec!["."]);
+            assert_eq!(
+                prepared.dns_rules[0].name_servers,
+                vec!["198.51.100.53"],
+                "{enabled_vpn} DNS must not leak into disabled {fallback_vpn} fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_vpn_hostname_excludes_the_disabled_fallback_dns_for_every_pair() {
+        for (enabled_vpn, fallback_vpn) in [
+            (VpnKind::FortiClient, VpnKind::F5),
+            (VpnKind::FortiClient, VpnKind::Ivanti),
+            (VpnKind::F5, VpnKind::FortiClient),
+            (VpnKind::F5, VpnKind::Ivanti),
+            (VpnKind::Ivanti, VpnKind::FortiClient),
+            (VpnKind::Ivanti, VpnKind::F5),
+        ] {
+            let mut app = full_tunnel_app(enabled_vpn);
+            app.adapters[0].dns_servers =
+                vec!["203.0.113.53".to_owned(), "198.51.100.53".to_owned()];
+            let (name, description) = match fallback_vpn {
+                VpnKind::FortiClient => (
+                    "FortiClient fallback",
+                    "Fortinet SSL VPN Virtual Ethernet Adapter",
+                ),
+                VpnKind::F5 => ("F5 fallback", "F5 Networks VPN Adapter"),
+                VpnKind::Ivanti => ("Ivanti fallback", "Pulse Secure Virtual Adapter"),
+            };
+            app.adapters.push(NetworkAdapter {
+                index: 44,
+                name: name.to_owned(),
+                description: description.to_owned(),
+                status: "Up".to_owned(),
+                next_hop: "0.0.0.0".to_owned(),
+                full_tunnel_priority: Some(RoutePriority {
+                    prefix_length: 2,
+                    effective_metric: 1,
+                }),
+                dns_servers: vec!["198.51.100.53".to_owned()],
+            });
+            let mut config = enabled_full_tunnel_config(&app, enabled_vpn);
+            config
+                .profile_mut(enabled_vpn)
+                .expect("enabled profile exists")
+                .networks = "service.example.test".to_owned();
+            let mut resolution_calls = 0;
+
+            let prepared = prepare_all_enabled_routes_with_resolver(
+                &config,
+                &app.adapters,
+                app.internet_gateway.as_ref(),
+                |vpn, hostname, servers| {
+                    resolution_calls += 1;
+                    assert_eq!(vpn, enabled_vpn);
+                    assert_eq!(hostname, "service.example.test");
+                    assert_eq!(servers, ["203.0.113.53"]);
+                    Ok(vec![Ipv4Addr::new(203, 0, 113, 10)])
+                },
+            )
+            .unwrap_or_else(|errors| panic!("{enabled_vpn} -> {fallback_vpn}: {errors:?}"));
+
+            assert_eq!(resolution_calls, 1);
+            assert!(prepared.dns_rules.contains(&ManagedDnsRule {
+                vpn: None,
+                namespaces: vec![".".to_owned()],
+                name_servers: vec!["198.51.100.53".to_owned()],
+            }));
+            assert!(prepared.dns_rules.contains(&ManagedDnsRule {
+                vpn: Some(enabled_vpn),
+                namespaces: vec!["service.example.test".to_owned()],
+                name_servers: vec!["203.0.113.53".to_owned()],
+            }));
         }
     }
 
